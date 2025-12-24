@@ -1,13 +1,13 @@
-// src/app/api/quotes/route.ts
+﻿// src/app/api/quotes/route.ts
 
-import { NextRequest, NextResponse } from 'next/server';
-import { supabaseServer } from '@/lib/supabaseServer';
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseServer } from "@/lib/supabaseServer";
 
 // Simple helper function to estimate a quote amount.
 // You can tweak this later to match your real-world pricing.
 function estimateQuoteAmount(params: {
   estimated_item_count?: number;
-  estimated_avg_weight: _estimated_avg_weight,
+  estimated_avg_weight?: number; // ✅ fixed
   estimated_heaviest_weight?: number;
   distance_km?: number;
 }) {
@@ -34,6 +34,12 @@ function estimateQuoteAmount(params: {
   // If very heavy items involved, add some extra time
   if (estimated_heaviest_weight > 150) {
     hours += 0.5; // add 30 minutes for very heavy stuff
+  }
+
+  // Optional: average-weight factor (light touch so it doesn't blow up pricing)
+  // You can remove this if you don't want weight to affect price yet.
+  if (estimated_avg_weight > 75) {
+    hours += 0.25; // add 15 minutes if the average items are heavy
   }
 
   // Distance factor (very rough for now)
@@ -68,7 +74,7 @@ export async function POST(req: NextRequest) {
     // Basic validation: require at least a location
     if (!job_location_address) {
       return NextResponse.json(
-        { error: 'job_location_address is required' },
+        { error: "job_location_address is required" },
         { status: 400 }
       );
     }
@@ -83,11 +89,11 @@ export async function POST(req: NextRequest) {
 
     // Insert into the quotes table
     const { data, error } = await supabaseServer
-      .from('quotes')
+      .from("quotes")
       .insert([
         {
           client_id: client_id || null,
-          status: 'pending',
+          status: "pending",
           job_location_address,
           estimated_item_count,
           estimated_avg_weight,
@@ -105,9 +111,9 @@ export async function POST(req: NextRequest) {
       .single();
 
     if (error) {
-      console.error('Error inserting quote:', error);
+      console.error("Error inserting quote:", error);
       return NextResponse.json(
-        { error: 'Failed to create quote' },
+        { error: "Failed to create quote" },
         { status: 500 }
       );
     }
@@ -115,9 +121,9 @@ export async function POST(req: NextRequest) {
     // Return the created quote record
     return NextResponse.json(data, { status: 201 });
   } catch (err) {
-    console.error('Unexpected error in POST /api/quotes:', err);
+    console.error("Unexpected error in POST /api/quotes:", err);
     return NextResponse.json(
-      { error: 'Invalid request or server error' },
+      { error: "Invalid request or server error" },
       { status: 500 }
     );
   }
