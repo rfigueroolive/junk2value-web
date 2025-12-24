@@ -22,7 +22,9 @@ export default function Home() {
             <a href="#how" className="hover:text-white">How it works</a>
             <a href="#pricing" className="hover:text-white">Pricing</a>
             <a href="#contact" className="hover:text-white">Contact</a>
-          </nav>
+            <Link href="/privacy" className="hover:text-white">Privacy</Link>
+            <Link href="/terms" className="hover:text-white">Terms</Link>
+</nav>
 
           <div className="flex items-center gap-2">
             <a
