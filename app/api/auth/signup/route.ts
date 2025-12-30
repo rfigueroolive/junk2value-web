@@ -1,23 +1,37 @@
-﻿// app/api/auth/signup/route.ts
+﻿// src/app/api/auth/signup/route.ts
+
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseServer } from "@/lib/supabaseServer";
+import { createClient } from "@supabase/supabase-js";
 import { sendFromNoreply } from "@/lib/mailgun";
 
 const CODE_EXPIRY_MINUTES = 10;
 
-// Generate a 6 digit numeric code like "123456"
 function generateCode(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function getSupabaseAdmin() {
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+  if (!url || !serviceKey) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  return createClient(url, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 }
 
 /**
  * POST /api/auth/signup
  *
- * Current flow:
- *  - Validate incoming fields from the client
- *  - (No profiles upsert yet. We will wire real accounts later.)
- *  - Create a row in email_verification_codes
- *  - Send the code to the email using Mailgun
+ * Flow:
+ *  - Validate fields
+ *  - Create Supabase Auth user (service role)
+ *  - Upsert profiles row
+ *  - Create email verification code row
+ *  - Send code via Mailgun
  */
 export async function POST(req: NextRequest) {
   try {
@@ -39,7 +53,6 @@ export async function POST(req: NextRequest) {
       sms_opt_in?: boolean | null;
     } = body;
 
-    // ----- Basic validation -----
     if (!name || !name.trim()) {
       return NextResponse.json(
         { success: false, message: "Name is required." },
@@ -69,7 +82,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Strong password: at least 6 chars, 1 lower, 1 upper, 1 digit, 1 symbol
     const strongPasswordPattern =
       /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{6,}$/;
 
@@ -84,23 +96,51 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    console.log("Signup request received:", {
-      name,
-      email,
-      company,
-      phone,
-      sms_opt_in,
-    });
+    const supabaseAdmin = getSupabaseAdmin();
 
-    const supabase = supabaseServer;
+    // 1) Create Auth user (so login works)
+    const { data: created, error: createErr } =
+      await supabaseAdmin.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true, // keep login working immediately
+        user_metadata: {
+          name: name.trim(),
+          company: company ?? null,
+          phone: phone ?? null,
+          sms_opt_in: !!sms_opt_in,
+        },
+      });
 
-    // ----- Generate and store verification code -----
+    if (createErr || !created?.user) {
+      return NextResponse.json(
+        { success: false, message: createErr?.message || "Failed to create user." },
+        { status: 400 }
+      );
+    }
+
+    const userId = created.user.id;
+
+    // 2) Upsert profile
+    await supabaseAdmin.from("profiles").upsert(
+      {
+        id: userId,
+        email,
+        full_name: name.trim(),
+        company: company ?? null,
+        phone: phone ?? null,
+        sms_opt_in: !!sms_opt_in,
+      },
+      { onConflict: "id" }
+    );
+
+    // 3) Generate and store verification code
     const code = generateCode();
     const expiresAt = new Date(
       Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000
     ).toISOString();
 
-    const { error: insertError } = await supabase
+    const { error: insertError } = await supabaseAdmin
       .from("email_verification_codes")
       .insert({
         email,
@@ -109,10 +149,6 @@ export async function POST(req: NextRequest) {
       });
 
     if (insertError) {
-      console.error(
-        "Supabase insert error (email_verification_codes):",
-        insertError
-      );
       return NextResponse.json(
         {
           success: false,
@@ -122,7 +158,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ----- Send email with code -----
+    // 4) Send email with code
     const text = `Your Junk2Value verification code is: ${code}`;
     const html = `
 <p>Your Junk2Value verification code is: <strong>${code}</strong></p>
@@ -130,23 +166,12 @@ export async function POST(req: NextRequest) {
 <p>If you did not request this, you can ignore this email.</p>
 `;
 
-    try {
-      await sendFromNoreply(
-        email,
-        "Your Junk2Value verification code",
-        text,
-        html
-      );
-    } catch (mailError: any) {
-      console.error("Mailgun send error (signup):", mailError);
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Failed to send verification email. Please try again.",
-        },
-        { status: 500 }
-      );
-    }
+    await sendFromNoreply(
+      email,
+      "Your Junk2Value verification code",
+      text,
+      html
+    );
 
     return NextResponse.json(
       {
