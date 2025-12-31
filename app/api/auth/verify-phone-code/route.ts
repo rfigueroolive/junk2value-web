@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
+function digitsOnly(s: string) {
+  return s.replace(/\D/g, "");
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { phone, code } = await req.json();
@@ -14,16 +18,39 @@ export async function POST(req: NextRequest) {
 
     const phoneStr = String(phone).trim();
     const codeStr = String(code).trim();
+    const nowIso = new Date().toISOString();
 
-    // Get the most recent matching code for this phone+code
-    const { data, error } = await supabaseServer
+    // Try exact match first (and let DB enforce not-expired)
+    let { data, error } = await supabaseServer
       .from("phone_verification_codes")
       .select("id, phone, code, expires_at")
       .eq("phone", phoneStr)
       .eq("code", codeStr)
-      .order("created_at", { ascending: false })
+      .gt("expires_at", nowIso)
+      .order("expires_at", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    // Fallback: match by last 10 digits (handles "+1" vs "970..." formatting)
+    if ((!data || error) && digitsOnly(phoneStr).length >= 10) {
+      const last10 = digitsOnly(phoneStr).slice(-10);
+
+      const res = await supabaseServer
+        .from("phone_verification_codes")
+        .select("id, phone, code, expires_at")
+        .eq("code", codeStr)
+        .gt("expires_at", nowIso)
+        .order("expires_at", { ascending: false })
+        .limit(10);
+
+      if (res.data && res.data.length) {
+        data = res.data.find((row) => {
+          const rowDigits = digitsOnly(String(row.phone || ""));
+          return rowDigits.slice(-10) === last10;
+        }) as any;
+        error = res.error ?? null;
+      }
+    }
 
     if (error || !data) {
       return NextResponse.json(
@@ -32,24 +59,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Expiry check
-    const expiresMs = new Date(data.expires_at).getTime();
-    if (!Number.isFinite(expiresMs) || Date.now() > expiresMs) {
-      return NextResponse.json(
-        { success: false, message: "Invalid or expired code" },
-        { status: 400 }
-      );
-    }
-
-    // Mark used (ignore if your table doesn't have `used`)
+    // Mark used (only if column exists)
     try {
       await supabaseServer
         .from("phone_verification_codes")
         .update({ used: true })
         .eq("id", data.id);
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
