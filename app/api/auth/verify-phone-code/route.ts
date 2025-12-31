@@ -1,4 +1,3 @@
-// app/api/auth/verify-phone-code/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
@@ -13,12 +12,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Find a matching, unexpired code
+    const phoneStr = String(phone).trim();
+    const codeStr = String(code).trim();
+
+    // Get the most recent matching code for this phone+code
     const { data, error } = await supabaseServer
       .from("phone_verification_codes")
-      .select("id, phone, code, expires_at, used")
-      .eq("phone", phone)
-      .eq("code", code)
+      .select("id, phone, code, expires_at")
+      .eq("phone", phoneStr)
+      .eq("code", codeStr)
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
 
     if (error || !data) {
@@ -29,27 +33,23 @@ export async function POST(req: NextRequest) {
     }
 
     // Expiry check
-    const expiresAt = new Date(data.expires_at).getTime();
-    if (Number.isFinite(expiresAt) && Date.now() > expiresAt) {
+    const expiresMs = new Date(data.expires_at).getTime();
+    if (!Number.isFinite(expiresMs) || Date.now() > expiresMs) {
       return NextResponse.json(
         { success: false, message: "Invalid or expired code" },
         { status: 400 }
       );
     }
 
-    // Used check (if your table has it)
-    if (data.used === true) {
-      return NextResponse.json(
-        { success: false, message: "Invalid or expired code" },
-        { status: 400 }
-      );
+    // Mark used (ignore if your table doesn't have `used`)
+    try {
+      await supabaseServer
+        .from("phone_verification_codes")
+        .update({ used: true })
+        .eq("id", data.id);
+    } catch {
+      // ignore
     }
-
-    // Mark used (safe even if column doesn't exist? if it doesn't, remove this block)
-    await supabaseServer
-      .from("phone_verification_codes")
-      .update({ used: true })
-      .eq("id", data.id);
 
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
