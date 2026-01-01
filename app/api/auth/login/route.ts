@@ -1,5 +1,4 @@
 // app/api/auth/login/route.ts
-
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { supabaseServer } from "@/lib/supabaseServer";
@@ -30,10 +29,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const supabaseAuth = getSupabaseAuthClient();
+    const supabase = getSupabaseAuthClient();
 
-    // Step 1: authenticate (password check)
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({
+    // 1) Attempt sign-in
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -47,37 +46,49 @@ export async function POST(req: NextRequest) {
 
     const userId = data.user.id;
 
-    // Step 2: enforce verification status from profiles
-    const { data: profile, error: profileErr } = await supabaseServer
+    // 2) Check our app-level verification flags in profiles
+    const { data: profile, error: profileError } = await supabaseServer
       .from("profiles")
       .select("email_verified, phone_verified, sms_opt_in")
       .eq("id", userId)
       .maybeSingle();
 
-    if (profileErr || !profile) {
+    if (profileError || !profile) {
+      // Don't allow login if profile isn't wired correctly
+      try {
+        await supabase.auth.signOut();
+      } catch {}
       return NextResponse.json(
-        { error: "Profile not found for this user." },
+        { error: "Account not initialized. Please sign up again." },
         { status: 403 }
       );
     }
 
-    // Email must be verified for everyone
-    if (profile.email_verified !== true) {
+    const emailVerified = profile.email_verified === true;
+    const smsOptIn = profile.sms_opt_in === true;
+    const phoneVerified = profile.phone_verified === true;
+
+    if (!emailVerified) {
+      try {
+        await supabase.auth.signOut();
+      } catch {}
       return NextResponse.json(
-        { error: "Email not verified.", needs: "email" },
+        { error: "Please verify your email before logging in." },
         { status: 403 }
       );
     }
 
-    // Phone must be verified only if sms_opt_in is true
-    if (profile.sms_opt_in === true && profile.phone_verified !== true) {
+    if (smsOptIn && !phoneVerified) {
+      try {
+        await supabase.auth.signOut();
+      } catch {}
       return NextResponse.json(
-        { error: "Phone not verified.", needs: "phone" },
+        { error: "Please verify your phone before logging in." },
         { status: 403 }
       );
     }
 
-    // Step 3: return session for the Android app
+    // 3) Return session (Android uses this token)
     return NextResponse.json(
       {
         user: data.user,
