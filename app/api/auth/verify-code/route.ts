@@ -6,87 +6,94 @@ export async function POST(req: NextRequest) {
   try {
     const { email, code } = await req.json();
 
-    if (!email || typeof email !== "string" || !code || typeof code !== "string") {
+    if (
+      !email ||
+      typeof email !== "string" ||
+      !code ||
+      typeof code !== "string"
+    ) {
       return NextResponse.json(
         { error: "Email and code are required" },
         { status: 400 }
       );
     }
 
-    const supabase = supabaseServer;
-
-    // Get the most recent code for this email
-    const { data, error } = await supabase
+    // 1) Find matching code row (latest)
+    const { data: codeRow, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
-      .select("*")
+      .select("id, expires_at")
       .eq("email", email)
-      .order("created_at", { ascending: false })
+      .eq("code", code)
+      .order("expires_at", { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
 
-    if (error) {
-      console.error("Supabase select error:", error);
+    if (codeErr || !codeRow) {
       return NextResponse.json(
-        { error: "Verification lookup failed" },
+        { error: "Invalid or expired code" },
+        { status: 400 }
+      );
+    }
+
+    // 2) Expiry check
+    const expiresAtMs = new Date(codeRow.expires_at).getTime();
+    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+      return NextResponse.json(
+        { error: "Invalid or expired code" },
+        { status: 400 }
+      );
+    }
+
+    // 3) Get the auth user by email (service role)
+    const { data: userData, error: userErr } =
+      await supabaseServer.auth.admin.getUserByEmail(email);
+
+    if (userErr || !userData?.user) {
+      return NextResponse.json(
+        { error: "User not found for this email" },
+        { status: 404 }
+      );
+    }
+
+    const userId = userData.user.id;
+
+    // 4) Mark profile as email verified
+    // NOTE: If the profile row doesn't exist yet, this update will affect 0 rows.
+    // So we upsert a row to guarantee the profile exists.
+    const { error: profErr } = await supabaseServer.from("profiles").upsert(
+      {
+        id: userId,
+        email,
+        email_verified: true,
+      },
+      { onConflict: "id" }
+    );
+
+    if (profErr) {
+      console.error("profiles upsert error:", profErr);
+      return NextResponse.json(
+        {
+          error: "Failed to update profile",
+          debug: {
+            code: profErr.code,
+            message: profErr.message,
+            details: profErr.details,
+            hint: profErr.hint,
+          },
+        },
         { status: 500 }
       );
     }
 
-    if (!data) {
-      return NextResponse.json(
-        { error: "No verification code found for this email" },
-        { status: 400 }
-      );
-    }
-
-    // Check code matches
-    if (data.code !== code) {
-      return NextResponse.json(
-        { error: "Invalid verification code" },
-        { status: 400 }
-      );
-    }
-
-    // Check not expired
-    const now = new Date();
-    const expiresAt = new Date(data.expires_at);
-
-    if (expiresAt.getTime() < now.getTime()) {
-      return NextResponse.json(
-        { error: "Verification code has expired" },
-        { status: 400 }
-      );
-    }
-
-    // Check not already used
-    if (data.consumed) {
-      return NextResponse.json(
-        { error: "Verification code has already been used" },
-        { status: 400 }
-      );
-    }
-
-    // Mark as consumed
-    const { error: updateError } = await supabase
+    // 5) Delete the used code row (prevents reuse)
+    await supabaseServer
       .from("email_verification_codes")
-      .update({ consumed: true })
-      .eq("id", data.id);
+      .delete()
+      .eq("id", codeRow.id);
 
-    if (updateError) {
-      console.error("Supabase update error:", updateError);
-      return NextResponse.json(
-        { error: "Failed to mark code as used" },
-        { status: 500 }
-      );
-    }
-
-    // All good 🎉
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
     console.error("verify-code error:", err);
-    return NextResponse.json(
-      { error: "Failed to verify code" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Failed to verify code" }, { status: 500 });
   }
 }
