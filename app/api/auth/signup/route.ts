@@ -81,10 +81,7 @@ export async function POST(req: NextRequest) {
 
     // If they opted in to SMS, require a phone number
     if (safeSmsOptIn && !safePhone) {
-      return jsonError(
-        "Phone is required when SMS consent is checked.",
-        400
-      );
+      return jsonError("Phone is required when SMS consent is checked.", 400);
     }
 
     console.log("Signup request received:", {
@@ -96,8 +93,6 @@ export async function POST(req: NextRequest) {
     });
 
     // ----- Create Supabase Auth user -----
-    // We set email_confirm=true so Supabase doesn't block sign-in on its own.
-    // Your app's "real verification" is controlled by your code + profile flags.
     const { data: created, error: createError } =
       await supabaseServer.auth.admin.createUser({
         email: safeEmail,
@@ -108,7 +103,6 @@ export async function POST(req: NextRequest) {
           company: safeCompany,
           phone: safePhone,
           sms_opt_in: safeSmsOptIn,
-          // App-level verification flags (you can also mirror these in profiles)
           email_verified: false,
           phone_verified: safeSmsOptIn ? false : true,
         },
@@ -117,49 +111,57 @@ export async function POST(req: NextRequest) {
     if (createError || !created?.user) {
       console.error("Supabase auth.admin.createUser error:", createError);
 
-      // Common: email already registered
       const msg =
         createError?.message?.toLowerCase().includes("already") === true
           ? "That email is already registered. Please log in instead."
           : "Failed to create user. Please try again.";
 
-      return jsonError(msg, 400);
+      return jsonError(msg, 400, {
+        debug: {
+          message: createError?.message,
+          status: (createError as any)?.status,
+        },
+      });
     }
 
     const userId = created.user.id;
 
     // ----- Create/Upsert profile row -----
-    // NOTE: These columns must exist in your profiles table:
-    // id, email, name, company, phone, sms_opt_in, email_verified, phone_verified
-    // If your column names differ, tell me the schema and I’ll adjust.
-    const { error: profileError } = await supabaseServer.from("profiles").upsert(
-      {
-        id: userId,
-        email: safeEmail,
-        name: safeName,
-        company: safeCompany,
-        phone: safePhone,
-        sms_opt_in: safeSmsOptIn,
-        email_verified: false,
-        phone_verified: safeSmsOptIn ? false : true,
-      },
-      { onConflict: "id" }
-    );
+    const profilePayload = {
+      id: userId,
+      email: safeEmail,
+      name: safeName,
+      company: safeCompany,
+      phone: safePhone,
+      sms_opt_in: safeSmsOptIn,
+      email_verified: false,
+      phone_verified: safeSmsOptIn ? false : true,
+    };
+
+    const { error: profileError } = await supabaseServer
+      .from("profiles")
+      .upsert(profilePayload, { onConflict: "id" });
 
     if (profileError) {
       console.error("Supabase upsert error (profiles):", profileError);
 
-      // If profile fails, we should clean up the auth user to avoid orphaned accounts
+      // Cleanup: avoid orphaned auth user
       try {
         await supabaseServer.auth.admin.deleteUser(userId);
       } catch (cleanupErr) {
         console.error("Failed cleanup deleteUser after profile error:", cleanupErr);
       }
 
-      return jsonError(
-        "Failed to create user profile. Please try again.",
-        500
-      );
+      // ✅ This is the important part: return the REAL reason
+      return jsonError("Failed to create user profile. Please try again.", 500, {
+        debug: {
+          attempted_profile_payload: profilePayload,
+          code: (profileError as any).code,
+          message: profileError.message,
+          details: (profileError as any).details,
+          hint: (profileError as any).hint,
+        },
+      });
     }
 
     // ----- Generate and store email verification code -----
@@ -177,10 +179,7 @@ export async function POST(req: NextRequest) {
       });
 
     if (insertError) {
-      console.error(
-        "Supabase insert error (email_verification_codes):",
-        insertError
-      );
+      console.error("Supabase insert error (email_verification_codes):", insertError);
 
       // Cleanup to avoid "created but can't verify" accounts
       try {
@@ -189,10 +188,14 @@ export async function POST(req: NextRequest) {
         console.error("Failed cleanup deleteUser after code insert error:", cleanupErr);
       }
 
-      return jsonError(
-        "Failed to create verification code. Please try again.",
-        500
-      );
+      return jsonError("Failed to create verification code. Please try again.", 500, {
+        debug: {
+          code: (insertError as any).code,
+          message: insertError.message,
+          details: (insertError as any).details,
+          hint: (insertError as any).hint,
+        },
+      });
     }
 
     // ----- Send email with code -----
@@ -204,12 +207,7 @@ export async function POST(req: NextRequest) {
 `;
 
     try {
-      await sendFromNoreply(
-        safeEmail,
-        "Your Junk2Value verification code",
-        text,
-        html
-      );
+      await sendFromNoreply(safeEmail, "Your Junk2Value verification code", text, html);
     } catch (mailError: any) {
       console.error("Mailgun send error (signup):", mailError);
 
@@ -220,17 +218,17 @@ export async function POST(req: NextRequest) {
         console.error("Failed cleanup deleteUser after mail error:", cleanupErr);
       }
 
-      return jsonError(
-        "Failed to send verification email. Please try again.",
-        500
-      );
+      return jsonError("Failed to send verification email. Please try again.", 500, {
+        debug: {
+          message: mailError?.message ?? String(mailError),
+        },
+      });
     }
 
     return NextResponse.json(
       {
         success: true,
-        message:
-          "Signup started. A verification code has been sent to your email.",
+        message: "Signup started. A verification code has been sent to your email.",
       },
       { status: 200 }
     );
