@@ -2,31 +2,29 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
+function normEmail(v: unknown) {
+  return typeof v === "string" ? v.trim().toLowerCase() : "";
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { email, code } = await req.json();
+    const body = await req.json();
+    const email = normEmail(body?.email);
+    const code = typeof body?.code === "string" ? body.code.trim() : "";
 
-    if (
-      !email ||
-      typeof email !== "string" ||
-      !code ||
-      typeof code !== "string"
-    ) {
+    if (!email || !code) {
       return NextResponse.json(
         { error: "Email and code are required" },
         { status: 400 }
       );
     }
 
-    const safeEmail = email.trim().toLowerCase();
-    const safeCode = code.trim();
-
     // 1) Find matching code row (latest)
     const { data: codeRow, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
       .select("id, expires_at")
-      .eq("email", safeEmail)
-      .eq("code", safeCode)
+      .eq("email", email)
+      .eq("code", code)
       .order("expires_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -47,46 +45,48 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3) Get the auth user by email (service role)
-    // Some Supabase SDK versions don't have getUserByEmail(), so we list users and match.
-    const { data: listData, error: listErr } =
-      await supabaseServer.auth.admin.listUsers({ page: 1, perPage: 200 });
+    // 3) Find the auth user by email (service role)
+    // NOTE: Your supabase-js/types don't include getUserByEmail(), so we list and match.
+    const { data: usersData, error: usersErr } =
+      await supabaseServer.auth.admin.listUsers({
+        page: 1,
+        perPage: 1000,
+      });
 
-    if (listErr || !listData?.users) {
+    if (usersErr) {
+      console.error("listUsers error:", usersErr);
       return NextResponse.json(
         {
-          error: "Failed to lookup user",
+          error: "Failed to look up user",
           debug: {
-            code: listErr?.code,
-            message: listErr?.message,
-            details: (listErr as any)?.details,
-            hint: (listErr as any)?.hint,
+            code: usersErr.code,
+            message: usersErr.message,
           },
         },
         { status: 500 }
       );
     }
 
-    const foundUser = listData.users.find(
-      (u) => (u.email ?? "").toLowerCase() === safeEmail
+    const user = usersData?.users?.find(
+      (u) => (u.email ?? "").trim().toLowerCase() === email
     );
 
-    if (!foundUser) {
+    if (!user) {
       return NextResponse.json(
         { error: "User not found for this email" },
         { status: 404 }
       );
     }
 
-    const userId = foundUser.id;
+    const userId = user.id;
 
-    // 4) Mark profile as email verified
-    // Upsert guarantees the profile exists.
+    // 4) Mark profile as email verified (upsert so it exists)
     const { error: profErr } = await supabaseServer.from("profiles").upsert(
       {
         id: userId,
-        email: safeEmail,
+        email,
         email_verified: true,
+        updated_at: new Date().toISOString(),
       },
       { onConflict: "id" }
     );
@@ -108,10 +108,15 @@ export async function POST(req: NextRequest) {
     }
 
     // 5) Delete the used code row (prevents reuse)
-    await supabaseServer
+    const { error: delErr } = await supabaseServer
       .from("email_verification_codes")
       .delete()
       .eq("id", codeRow.id);
+
+    if (delErr) {
+      // Not fatal, but good to know
+      console.warn("Failed to delete used email code row:", delErr);
+    }
 
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
