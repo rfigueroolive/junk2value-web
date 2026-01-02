@@ -2,24 +2,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json({ success: false, error: message, ...(extra ?? {}) }, { status });
-}
-
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const emailRaw = typeof body?.email === "string" ? body.email : "";
-    const codeRaw = typeof body?.code === "string" ? body.code : "";
 
-    const email = emailRaw.trim().toLowerCase();
-    const code = codeRaw.trim();
+    // Normalize inputs so casing/spaces never cause mismatches
+    const rawEmail = typeof body?.email === "string" ? body.email : "";
+    const rawCode = typeof body?.code === "string" ? body.code : "";
+
+    const email = rawEmail.trim().toLowerCase();
+    const code = rawCode.trim();
 
     if (!email || !code) {
-      return jsonError("Email and code are required", 400);
+      return NextResponse.json(
+        { success: false, error: "Email and code are required" },
+        { status: 400 }
+      );
     }
 
-    // 1) Find the matching code row (newest first)
+    // 1) Find matching code row (latest)
     const { data: codeRow, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
       .select("id, expires_at")
@@ -29,77 +30,77 @@ export async function POST(req: NextRequest) {
       .limit(1)
       .maybeSingle();
 
-    if (codeErr) {
-      console.error("verify-code select error:", codeErr);
-      return jsonError("Server error checking code", 500, {
-        debug: { message: codeErr.message, details: (codeErr as any).details, hint: (codeErr as any).hint },
-      });
-    }
-
-    if (!codeRow) {
-      // Important: this means there is NO row in the table matching email+code
-      return jsonError("Invalid or expired code", 400);
+    if (codeErr || !codeRow) {
+      return NextResponse.json(
+        { success: false, error: "Invalid or expired code" },
+        { status: 400 }
+      );
     }
 
     // 2) Expiry check
     const expiresAtMs = new Date(codeRow.expires_at).getTime();
     if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
-      return jsonError("Invalid or expired code", 400);
+      return NextResponse.json(
+        { success: false, error: "Invalid or expired code" },
+        { status: 400 }
+      );
     }
 
-    // 3) Find the profile by email (NO admin getUserByEmail needed)
-    const { data: profile, error: profFindErr } = await supabaseServer
-      .from("profiles")
-      .select("id")
-      .eq("email", email)
-      .maybeSingle();
-
-    if (profFindErr) {
-      console.error("verify-code profile lookup error:", profFindErr);
-      return jsonError("Failed to find user profile", 500, {
-        debug: {
-          message: profFindErr.message,
-          details: (profFindErr as any).details,
-          hint: (profFindErr as any).hint,
-        },
-      });
-    }
-
-    if (!profile?.id) {
-      return jsonError("User profile not found for this email", 404);
-    }
-
-    // 4) Mark email verified
-    const { error: profUpdateErr } = await supabaseServer
+    // 3) Mark profile as email verified (NO auth.admin.getUserByEmail needed)
+    // We update by email because that's stable and avoids admin API differences.
+    const { data: updatedProfile, error: profErr } = await supabaseServer
       .from("profiles")
       .update({ email_verified: true })
-      .eq("id", profile.id);
+      .eq("email", email)
+      .select("id, email, email_verified")
+      .maybeSingle();
 
-    if (profUpdateErr) {
-      console.error("verify-code profile update error:", profUpdateErr);
-      return jsonError("Failed to update profile", 500, {
-        debug: {
-          message: profUpdateErr.message,
-          details: (profUpdateErr as any).details,
-          hint: (profUpdateErr as any).hint,
+    if (profErr) {
+      console.error("profiles update error:", profErr);
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Failed to update profile",
+          debug: {
+            code: (profErr as any).code,
+            message: profErr.message,
+            details: (profErr as any).details,
+            hint: (profErr as any).hint,
+          },
         },
-      });
+        { status: 500 }
+      );
     }
 
-    // 5) Delete used code row (prevents reuse)
+    if (!updatedProfile) {
+      // This means the user exists in auth but no profile row exists (or email mismatch).
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Profile not found for this email",
+          debug: { email },
+        },
+        { status: 404 }
+      );
+    }
+
+    // 4) Delete the used code row (prevents reuse)
     const { error: delErr } = await supabaseServer
       .from("email_verification_codes")
       .delete()
       .eq("id", codeRow.id);
 
     if (delErr) {
-      console.error("verify-code delete error:", delErr);
-      // Not fatal to verification, but it’s cleaner to know
+      // Not fatal, but log it so you can clean up later
+      console.error("email_verification_codes delete error:", delErr);
     }
 
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
     console.error("verify-code error:", err);
-    return NextResponse.json({ success: false, error: "Failed to verify code" }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: "Failed to verify code" },
+      { status: 500 }
+    );
   }
 }
