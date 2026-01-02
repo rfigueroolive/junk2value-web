@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json({ success: false, error: message, message, ...(extra ?? {}) }, { status });
+  return NextResponse.json(
+    { success: false, error: message, message, ...(extra ?? {}) },
+    { status }
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -17,32 +20,36 @@ export async function POST(req: NextRequest) {
       return jsonError("Email and code are required", 400);
     }
 
-    // 1) Get the MOST RECENT code row for this email (don’t filter by code in SQL)
-    const { data: codeRow, error: codeErr } = await supabaseServer
+    // 1) Pull recent codes for this email (don’t assume latest is the one they typed)
+    const { data: rows, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
       .select("id, code, expires_at, created_at")
       .eq("email", safeEmail)
       .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .limit(20);
 
-    if (codeErr || !codeRow) {
-      return jsonError("Invalid or expired code", 400, { debug: { codeErr: codeErr ?? null } });
+    if (codeErr || !rows || rows.length === 0) {
+      return jsonError("Invalid or expired code", 400, {
+        debug: { codeErr: codeErr ?? null, found: rows?.length ?? 0 },
+      });
     }
 
-    // 2) Expiry check
-    const expiresAtMs = new Date(codeRow.expires_at).getTime();
-    if (!Number.isFinite(expiresAtMs) || Date.now() > expiresAtMs) {
-      return jsonError("Invalid or expired code", 400);
+    // 2) Find a matching NON-expired row
+    const now = Date.now();
+    const match = rows.find((r) => {
+      const stored = String(r.code ?? "").trim();
+      const expMs = new Date(r.expires_at).getTime();
+      const notExpired = Number.isFinite(expMs) && now <= expMs;
+      return notExpired && stored === safeCode;
+    });
+
+    if (!match) {
+      return jsonError("Invalid or expired code", 400, {
+        debug: { found: rows.length, note: "No non-expired match among recent codes" },
+      });
     }
 
-    // 3) Compare code in JS to avoid DB type mismatch (int vs string)
-    const storedCode = String(codeRow.code).trim();
-    if (storedCode !== safeCode) {
-      return jsonError("Invalid or expired code", 400);
-    }
-
-    // 4) Get the auth user by email (service role)
+    // 3) Get auth user by email (service role)
     const { data: userData, error: userErr } =
       await supabaseServer.auth.admin.getUserByEmail(safeEmail);
 
@@ -54,7 +61,7 @@ export async function POST(req: NextRequest) {
 
     const userId = userData.user.id;
 
-    // 5) Mark profile as email verified (upsert so it works even if profile row is missing)
+    // 4) Mark profile email verified (upsert so it works even if profile row is missing)
     const { error: profErr } = await supabaseServer.from("profiles").upsert(
       {
         id: userId,
@@ -75,8 +82,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 6) Delete the used code row
-    await supabaseServer.from("email_verification_codes").delete().eq("id", codeRow.id);
+    // 5) Delete the code that matched (and optionally clean up old ones)
+    await supabaseServer.from("email_verification_codes").delete().eq("id", match.id);
 
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
