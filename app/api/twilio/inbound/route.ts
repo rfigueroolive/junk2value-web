@@ -60,7 +60,8 @@ export async function POST(req: NextRequest) {
     const isStart = keyword === "START";
     const isHelp = keyword === "HELP";
 
-    const sb = supabaseServer(); // service-role on server
+    // ✅ IMPORTANT: supabaseServer is a client object in this codebase (NOT a function)
+    const sb = supabaseServer;
 
     // Always log the inbound message + keep opt state in one place
     const nowIso = new Date().toISOString();
@@ -115,7 +116,7 @@ export async function POST(req: NextRequest) {
     );
 
     return twiml("Junk2Value: Got it. Reply HELP for options.");
-  } catch (err) {
+  } catch (_err) {
     // Never throw raw errors back to Twilio; just respond with TwiML.
     return twiml("Junk2Value: Sorry—something went wrong on our end.");
   }
