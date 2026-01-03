@@ -1,67 +1,68 @@
-﻿// src/app/api/auth/verify-code/route.ts
+﻿// junk2value-web/app/api/auth/verify-code/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json(
-    { success: false, error: message, message, ...(extra ?? {}) },
-    { status }
-  );
+  return NextResponse.json({ success: false, error: message, message, ...(extra ?? {}) }, { status });
 }
 
 export async function POST(req: NextRequest) {
   try {
     const { email, code } = await req.json();
 
-    const safeEmail = (typeof email === "string" ? email : "").trim().toLowerCase();
-    const safeCode = (typeof code === "string" ? code : "").trim();
+    const safeEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const safeCode = typeof code === "string" ? code.trim() : "";
 
     if (!safeEmail || !safeCode) {
       return jsonError("Email and code are required", 400);
     }
 
-    // 1) Pull recent codes for this email (don’t assume latest is the one they typed)
-    const { data: rows, error: codeErr } = await supabaseServer
+    // 1) Find matching code row (latest)
+    const { data: codeRow, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
-      .select("id, code, expires_at, created_at")
+      .select("id, expires_at")
       .eq("email", safeEmail)
-      .order("created_at", { ascending: false })
-      .limit(20);
+      .eq("code", safeCode)
+      .order("expires_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (codeErr || !rows || rows.length === 0) {
+    if (codeErr || !codeRow) {
       return jsonError("Invalid or expired code", 400, {
-        debug: { codeErr: codeErr ?? null, found: rows?.length ?? 0 },
+        debug: { codeErr: codeErr ? { message: codeErr.message } : null },
       });
     }
 
-    // 2) Find a matching NON-expired row
-    const now = Date.now();
-    const match = rows.find((r) => {
-      const stored = String(r.code ?? "").trim();
-      const expMs = new Date(r.expires_at).getTime();
-      const notExpired = Number.isFinite(expMs) && now <= expMs;
-      return notExpired && stored === safeCode;
+    // 2) Expiry check
+    const expiresAtMs = new Date(codeRow.expires_at).getTime();
+    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+      return jsonError("Invalid or expired code", 400);
+    }
+
+    // 3) Get auth user by email (NO getUserByEmail in this supabase-js version)
+    // We use listUsers() and search for the matching email.
+    const { data: usersData, error: listErr } = await supabaseServer.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
     });
 
-    if (!match) {
-      return jsonError("Invalid or expired code", 400, {
-        debug: { found: rows.length, note: "No non-expired match among recent codes" },
+    if (listErr) {
+      return jsonError("Failed to look up user", 500, {
+        debug: { message: listErr.message },
       });
     }
 
-    // 3) Get auth user by email (service role)
-    const { data: userData, error: userErr } =
-      await supabaseServer.auth.admin.getUserByEmail(safeEmail);
+    const matchedUser = usersData?.users?.find(
+      (u) => (u.email ?? "").toLowerCase() === safeEmail
+    );
 
-    if (userErr || !userData?.user) {
-      return jsonError("User not found for this email", 404, {
-        debug: { userErr: userErr ?? null },
-      });
+    if (!matchedUser?.id) {
+      return jsonError("User not found for this email", 404);
     }
 
-    const userId = userData.user.id;
+    const userId = matchedUser.id;
 
-    // 4) Mark profile email verified (upsert so it works even if profile row is missing)
+    // 4) Mark profile as email verified (upsert guarantees row exists)
     const { error: profErr } = await supabaseServer.from("profiles").upsert(
       {
         id: userId,
@@ -82,12 +83,14 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 5) Delete the code that matched (and optionally clean up old ones)
-    await supabaseServer.from("email_verification_codes").delete().eq("id", match.id);
+    // 5) Delete the used code row (prevents reuse)
+    await supabaseServer.from("email_verification_codes").delete().eq("id", codeRow.id);
 
-    return NextResponse.json({ success: true }, { status: 200 });
-  } catch (err) {
+    return NextResponse.json({ success: true, message: "Email verified." }, { status: 200 });
+  } catch (err: any) {
     console.error("verify-code error:", err);
-    return jsonError("Failed to verify code", 500);
+    return jsonError("Failed to verify code", 500, {
+      debug: { message: err?.message ?? String(err) },
+    });
   }
 }
