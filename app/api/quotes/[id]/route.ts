@@ -12,13 +12,10 @@ function getBearerToken(req: NextRequest): string | null {
   return token?.trim() || null;
 }
 
-type RouteContext = {
-  params: Promise<{ id: string }>;
-};
-
-export async function PATCH(req: NextRequest, context: RouteContext) {
+export async function PATCH(req: NextRequest, context: any) {
   try {
-    const { id: quoteId } = await context.params;
+    // ✅ Works whether context.params is an object OR a Promise
+    const { id: quoteId } = await Promise.resolve(context?.params);
 
     const token = getBearerToken(req);
     if (!token) {
@@ -78,7 +75,7 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
 
     const body = await req.json();
 
-    // Only allow editing safe fields (expand later as needed)
+    // Only allow editing safe fields (expand later)
     const updates: Record<string, unknown> = {};
 
     if (typeof body.job_location_address === "string") {
@@ -100,9 +97,6 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
     if (Object.keys(updates).length === 0) {
       return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });
     }
-
-    // Optional policy: editing forces re-review (uncomment if you want)
-    // updates.status = "pending";
 
     const { data: updated, error: updateErr } = await supabaseServer
       .from("quotes")

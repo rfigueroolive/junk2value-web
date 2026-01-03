@@ -12,13 +12,9 @@ function getBearerToken(req: NextRequest): string | null {
   return token?.trim() || null;
 }
 
-type RouteContext = {
-  params: Promise<{ id: string }>;
-};
-
-export async function POST(req: NextRequest, context: RouteContext) {
+export async function POST(req: NextRequest, context: any) {
   try {
-    const { id: quoteId } = await context.params;
+    const { id: quoteId } = await Promise.resolve(context?.params);
 
     const token = getBearerToken(req);
     if (!token) {
@@ -32,7 +28,6 @@ export async function POST(req: NextRequest, context: RouteContext) {
 
     const email = userData.user.email.trim().toLowerCase();
 
-    // Find profile
     const { data: profile, error: profileErr } = await supabaseServer
       .from("profiles")
       .select("id")
@@ -43,7 +38,6 @@ export async function POST(req: NextRequest, context: RouteContext) {
       return NextResponse.json({ error: "Profile not found" }, { status: 404 });
     }
 
-    // Load quote + ownership
     const { data: quote, error: quoteErr } = await supabaseServer
       .from("quotes")
       .select("id, client_id, status")
@@ -60,7 +54,6 @@ export async function POST(req: NextRequest, context: RouteContext) {
 
     const status = String(quote.status || "").toLowerCase();
 
-    // ✅ Approved = locked forever
     if (status === "approved") {
       return NextResponse.json(
         { error: "This quote is approved and locked. You can no longer cancel it." },
@@ -68,7 +61,6 @@ export async function POST(req: NextRequest, context: RouteContext) {
       );
     }
 
-    // Optional: if already cancelled, just return OK
     if (status === "cancelled") {
       return NextResponse.json({ success: true, status: "cancelled" }, { status: 200 });
     }
