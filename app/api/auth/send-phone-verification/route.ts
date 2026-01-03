@@ -1,4 +1,4 @@
-﻿// src/app/api/auth/send-phone-verification/route.ts
+﻿// junk2value-web/app/api/auth/send-phone-verification/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import twilio from "twilio";
@@ -23,17 +23,15 @@ function normalizePhoneToE164(input: string): string | null {
   const raw = (input ?? "").trim();
   if (!raw) return null;
 
-  // Keep leading + if present, strip everything else non-digit
   const hasPlus = raw.startsWith("+");
   const digits = raw.replace(/[^\d]/g, "");
 
   if (hasPlus) {
-    // E.164 max is 15 digits after +
     if (digits.length < 8 || digits.length > 15) return null;
     return `+${digits}`;
   }
 
-  // Assume US if they didn't include +
+  // Assume US if no +
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
 
@@ -51,7 +49,10 @@ export async function POST(req: NextRequest) {
 
     const to = normalizePhoneToE164(phone);
     if (!to) {
-      return jsonError("Phone number must be a valid US number (10 digits) or E.164 (+...).", 400);
+      return jsonError(
+        "Phone number must be a valid US number (10 digits) or E.164 (+...).",
+        400
+      );
     }
 
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -69,9 +70,7 @@ export async function POST(req: NextRequest) {
     const code = generateCode();
     const expiresAt = new Date(Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
-    // 2) Store code (so verify-phone-code can validate it)
-    // Expected table: phone_verification_codes(phone text, code text, expires_at timestamptz, created_at timestamptz)
-    // You can set a UNIQUE constraint on phone and use onConflict: "phone".
+    // 2) Store code (expected table: phone_verification_codes)
     const { error: insertErr } = await supabaseServer
       .from("phone_verification_codes")
       .upsert(
@@ -97,7 +96,8 @@ export async function POST(req: NextRequest) {
     // 3) Send SMS
     const client = twilio(accountSid, authToken);
 
-    // Professional, short, and clear. (Trial prefix is unavoidable on Twilio trial.)
+    // NOTE: Twilio Trial will still prepend: "Sent from your Twilio trial account -"
+    // We can't remove that until the account/number is out of trial.
     const smsBody =
       `Junk2Value: Your phone verification code is ${code}. ` +
       `It expires in ${CODE_EXPIRY_MINUTES} minutes. ` +
@@ -119,3 +119,4 @@ export async function POST(req: NextRequest) {
     });
   }
 }
+
