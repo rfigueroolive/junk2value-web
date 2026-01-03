@@ -10,8 +10,15 @@ function generateCode(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json({ success: false, message, ...(extra ?? {}) }, { status });
+function jsonError(
+  message: string,
+  status: number,
+  extra?: Record<string, unknown>
+) {
+  return NextResponse.json(
+    { success: false, message, ...(extra ?? {}) },
+    { status }
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -36,7 +43,9 @@ export async function POST(req: NextRequest) {
     }
 
     const code = generateCode();
-    const expiresAt = new Date(Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000).toISOString();
+    const expiresAt = new Date(
+      Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000
+    ).toISOString();
 
     // ✅ IMPORTANT FIX:
     // Don't use upsert/onConflict unless the table has a UNIQUE constraint.
@@ -74,7 +83,8 @@ export async function POST(req: NextRequest) {
     // Professional message (Twilio Trial will still prepend its trial disclaimer automatically)
     const smsBody =
       `Junk2Value: Your verification code is ${code}. ` +
-      `It expires in ${CODE_EXPIRY_MINUTES} minutes.`;
+      `It expires in ${CODE_EXPIRY_MINUTES} minutes. ` +
+      `Reply STOP to opt out, HELP for help. Msg & data rates may apply.`;
 
     const client = twilio(accountSid, authToken);
 
