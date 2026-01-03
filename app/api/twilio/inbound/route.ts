@@ -1,84 +1,122 @@
+// app/api/twilio/inbound/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
-import twilio from "twilio";
 
-/**
- * Twilio inbound SMS webhook
- *
- * Configure in Twilio Console:
- *  Messaging -> Services -> (your service) -> Inbound Settings
- *  "Incoming Messages" webhook:
- *    https://www.junk2value.com/api/twilio/inbound   (POST)
- *
- * What it does:
- *  - STOP / UNSUBSCRIBE / CANCEL / END / QUIT  -> mark opted_out=true
- *  - START / YES / UNSTOP                      -> mark opted_out=false
- *  - HELP / INFO                               -> reply with your help text
- *
- * NOTE: Twilio may also perform its own opt-out enforcement automatically.
- * This route makes it "real" in your database too.
- */
+// Twilio expects TwiML (XML) responses for inbound SMS webhooks.
+function twiml(message: string) {
+  const xml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response><Message>${escapeXml(message)}</Message></Response>`;
 
-function normalize(s: string) {
-  return s.trim().toUpperCase();
+  return new NextResponse(xml, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/xml; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+function escapeXml(str: string) {
+  return str
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function normalizeKeyword(body: string) {
+  // Twilio sends the full body; we only care about the first "word" command.
+  const first = body.trim().split(/\s+/)[0] ?? "";
+  return first.toUpperCase();
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const form = await req.formData();
+    // Twilio sends application/x-www-form-urlencoded
+    const raw = await req.text();
+    const params = new URLSearchParams(raw);
 
-    // Twilio sends form-encoded fields
-    const from = String(form.get("From") ?? "").trim();
-    const body = String(form.get("Body") ?? "").trim();
+    const from = (params.get("From") ?? "").trim(); // e.g. +19702082722
+    const body = (params.get("Body") ?? "").trim();
 
     if (!from) {
-      return new NextResponse("Missing From", { status: 400 });
+      // If Twilio can't provide From, just respond politely.
+      return twiml("Missing sender number.");
     }
 
-    const msg = normalize(body);
+    const keyword = normalizeKeyword(body);
 
-    const stopWords = new Set(["STOP", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"]);
-    const startWords = new Set(["START", "YES", "UNSTOP"]);
-    const helpWords = new Set(["HELP", "INFO"]);
+    // STOP keywords per common carrier conventions
+    const isStop =
+      keyword === "STOP" ||
+      keyword === "STOPALL" ||
+      keyword === "UNSUBSCRIBE" ||
+      keyword === "CANCEL" ||
+      keyword === "END" ||
+      keyword === "QUIT";
 
-    let reply = "";
+    const isStart = keyword === "START";
+    const isHelp = keyword === "HELP";
 
-    if (stopWords.has(msg)) {
-      // Save opt-out in DB
-      await supabaseServer.from("sms_preferences").upsert(
-        { phone: from, opted_out: true, updated_at: new Date().toISOString() },
-        { onConflict: "phone" }
+    const sb = supabaseServer(); // service-role on server
+
+    // Always log the inbound message + keep opt state in one place
+    const nowIso = new Date().toISOString();
+
+    if (isStop) {
+      await sb.from("sms_opt_outs").upsert(
+        {
+          phone_e164: from,
+          opted_out: true,
+          opted_out_at: nowIso,
+          last_inbound_body: body,
+          last_inbound_at: nowIso,
+        },
+        { onConflict: "phone_e164" }
       );
 
-      reply =
-        "Junk2Value: You’re opted out and will no longer receive text messages. Reply START to re-subscribe.";
-    } else if (startWords.has(msg)) {
-      await supabaseServer.from("sms_preferences").upsert(
-        { phone: from, opted_out: false, updated_at: new Date().toISOString() },
-        { onConflict: "phone" }
+      return twiml(
+        "Junk2Value: You’re opted out and will no longer receive texts. Reply START to opt back in."
       );
-
-      reply =
-        "Junk2Value: You’re re-subscribed. Reply STOP to opt out again.";
-    } else if (helpWords.has(msg)) {
-      reply =
-        "Junk2Value support: Reply STOP to opt out, START to re-subscribe. For help, email support@junk2value.com or call (970) 208-2722.";
-    } else {
-      // Optional: ignore everything else, or send a generic reply
-      reply =
-        "Junk2Value: Thanks! For help reply HELP. To stop messages reply STOP.";
     }
 
-    // TwiML response
-    const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message(reply);
+    if (isStart) {
+      await sb.from("sms_opt_outs").upsert(
+        {
+          phone_e164: from,
+          opted_out: false,
+          // keep opted_out_at as last time they opted out; not critical either way
+          last_inbound_body: body,
+          last_inbound_at: nowIso,
+        },
+        { onConflict: "phone_e164" }
+      );
 
-    return new NextResponse(twiml.toString(), {
-      status: 200,
-      headers: { "Content-Type": "text/xml" },
-    });
-  } catch (e: any) {
-    console.error("Twilio inbound webhook error:", e);
-    return new NextResponse("Server error", { status: 500 });
+      return twiml("Junk2Value: You’re opted back in. Reply STOP to opt out again.");
+    }
+
+    if (isHelp) {
+      return twiml(
+        "Junk2Value Help: Reply STOP to opt out, START to opt back in. For support, reply here or email support@junk2value.com."
+      );
+    }
+
+    // Default behavior: don’t change opt status; just acknowledge
+    await sb.from("sms_opt_outs").upsert(
+      {
+        phone_e164: from,
+        // Do NOT force opted_out either way here; only set it on STOP/START.
+        last_inbound_body: body,
+        last_inbound_at: nowIso,
+      },
+      { onConflict: "phone_e164" }
+    );
+
+    return twiml("Junk2Value: Got it. Reply HELP for options.");
+  } catch (err) {
+    // Never throw raw errors back to Twilio; just respond with TwiML.
+    return twiml("Junk2Value: Sorry—something went wrong on our end.");
   }
 }
