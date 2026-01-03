@@ -1,152 +1,121 @@
-﻿// app/api/auth/send-phone-verification/route.ts
+﻿// src/app/api/auth/send-phone-verification/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import twilio from "twilio";
 
 const CODE_EXPIRY_MINUTES = 10;
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const fromNumber = process.env.TWILIO_FROM_NUMBER;
-
-// Simple helper to normalize phone into E.164 (US-biased)
-function normalizePhone(raw: string): string {
-  const trimmed = raw.trim();
-
-  // If user already typed +1970... just trust it
-  if (trimmed.startsWith("+")) {
-    return trimmed;
-  }
-
-  // Strip everything that isn't a digit
-  const digits = trimmed.replace(/\D/g, "");
-
-  // 10 digits → assume US and prefix +1
-  if (digits.length === 10) {
-    return `+1${digits}`;
-  }
-
-  // 11 digits starting with 1 → +1XXXXXXXXXX
-  if (digits.length === 11 && digits.startsWith("1")) {
-    return `+${digits}`;
-  }
-
-  // Fallback: just slap a + on it so Twilio gives a clear error
-  return `+${digits}`;
-}
-
 function generateCode(): string {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-export async function POST(req: NextRequest) {
-  if (!accountSid || !authToken || !fromNumber) {
-    console.error("Twilio env vars missing.");
-    return NextResponse.json(
-      {
-        success: false,
-        message:
-          "SMS is not configured on the server yet. (Missing Twilio credentials.)",
-      },
-      { status: 500 }
-    );
+function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
+  return NextResponse.json({ success: false, message, ...(extra ?? {}) }, { status });
+}
+
+/**
+ * Normalizes US numbers to E.164:
+ *  - "9702082722" -> "+19702082722"
+ *  - "(970) 208-2722" -> "+19702082722"
+ *  - "+19702082722" -> "+19702082722"
+ */
+function normalizePhoneToE164(input: string): string | null {
+  const raw = (input ?? "").trim();
+  if (!raw) return null;
+
+  // Keep leading + if present, strip everything else non-digit
+  const hasPlus = raw.startsWith("+");
+  const digits = raw.replace(/[^\d]/g, "");
+
+  if (hasPlus) {
+    // E.164 max is 15 digits after +
+    if (digits.length < 8 || digits.length > 15) return null;
+    return `+${digits}`;
   }
 
+  // Assume US if they didn't include +
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+
+  return null;
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as { phone?: string };
+    const body = await req.json();
+    const phone = body?.phone;
 
-    let { phone } = body;
-    if (!phone || !phone.trim()) {
-      return NextResponse.json(
-        { success: false, message: "Phone number is required." },
-        { status: 400 }
+    if (!phone || typeof phone !== "string") {
+      return jsonError("Phone is required.", 400);
+    }
+
+    const to = normalizePhoneToE164(phone);
+    if (!to) {
+      return jsonError("Phone number must be a valid US number (10 digits) or E.164 (+...).", 400);
+    }
+
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_FROM_NUMBER;
+
+    if (!accountSid || !authToken || !fromNumber) {
+      return jsonError(
+        "SMS is not configured on the server yet. (Missing Twilio credentials.)",
+        500
       );
     }
 
-    // Normalize for Twilio
-    const normalizedPhone = normalizePhone(phone);
-    console.log("Phone verification requested for:", {
-      raw: phone,
-      normalized: normalizedPhone,
-    });
-
-    // Generate code + expiry
+    // 1) Create code + expiry
     const code = generateCode();
-    const now = new Date();
-    const expiresAt = new Date(
-      now.getTime() + CODE_EXPIRY_MINUTES * 60 * 1000
-    ).toISOString();
+    const expiresAt = new Date(Date.now() + CODE_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
-    const supabase = supabaseServer;
-
-    // Store the code in Supabase
-    const { error: insertError } = await supabase
+    // 2) Store code (so verify-phone-code can validate it)
+    // Expected table: phone_verification_codes(phone text, code text, expires_at timestamptz, created_at timestamptz)
+    // You can set a UNIQUE constraint on phone and use onConflict: "phone".
+    const { error: insertErr } = await supabaseServer
       .from("phone_verification_codes")
-      .insert({
-        phone: normalizedPhone,
-        code,
-        expires_at: expiresAt,
-      });
-
-    if (insertError) {
-      console.error("Supabase insert error (phone_verification_codes):", insertError);
-      return NextResponse.json(
+      .upsert(
         {
-          success: false,
-          message: "Failed to create phone verification code. Please try again.",
+          phone: to,
+          code,
+          expires_at: expiresAt,
         },
-        { status: 500 }
+        { onConflict: "phone" }
       );
+
+    if (insertErr) {
+      return jsonError("Failed to create phone verification code.", 500, {
+        debug: {
+          code: (insertErr as any).code,
+          message: insertErr.message,
+          details: (insertErr as any).details,
+          hint: (insertErr as any).hint,
+        },
+      });
     }
 
-    // Send SMS via Twilio
+    // 3) Send SMS
     const client = twilio(accountSid, authToken);
 
-    try {
-      const message = await client.messages.create({
-        body: `Your Junk2Value phone verification code is: ${code}`,
-        to: normalizedPhone,
-        from: fromNumber,
-      });
+    // Professional, short, and clear. (Trial prefix is unavoidable on Twilio trial.)
+    const smsBody =
+      `Junk2Value: Your phone verification code is ${code}. ` +
+      `It expires in ${CODE_EXPIRY_MINUTES} minutes. ` +
+      `Do not share this code. Reply STOP to opt out.`;
 
-      console.log("Twilio SMS sent:", {
-        sid: message.sid,
-        status: message.status,
-        to: message.to,
-      });
+    await client.messages.create({
+      from: fromNumber,
+      to,
+      body: smsBody,
+    });
 
-      return NextResponse.json(
-        {
-          success: true,
-          message: "Verification code SMS sent.",
-          twilioStatus: message.status,
-        },
-        { status: 200 }
-      );
-    } catch (twErr: any) {
-      console.error("Twilio send error:", twErr);
-
-      // Twilio errors usually have twErr.code / twErr.message
-      const msg =
-        twErr?.message ||
-        "SMS provider rejected the request. Check Twilio logs for details.";
-
-      return NextResponse.json(
-        {
-          success: false,
-          message: msg,
-        },
-        { status: 500 }
-      );
-    }
-  } catch (err: any) {
-    console.error("Error in POST /api/auth/send-phone-verification:", err);
     return NextResponse.json(
-      {
-        success: false,
-        message: "Unexpected server error while sending SMS.",
-      },
-      { status: 500 }
+      { success: true, message: "Phone verification code sent." },
+      { status: 200 }
     );
+  } catch (err: any) {
+    return jsonError("Failed to send SMS code.", 500, {
+      debug: { message: err?.message ?? String(err) },
+    });
   }
 }
