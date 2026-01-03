@@ -1,20 +1,24 @@
-// src/app/api/quotes/[id]/route.ts
+// app/api/quotes/[id]/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 function getBearerToken(req: NextRequest): string | null {
   const auth = req.headers.get("authorization") || req.headers.get("Authorization");
   if (!auth) return null;
-  const parts = auth.split(" ");
-  if (parts.length !== 2) return null;
-  const [scheme, token] = parts;
-  if (scheme.toLowerCase() !== "bearer") return null;
+
+  const [scheme, token] = auth.split(" ");
+  if (!scheme || scheme.toLowerCase() !== "bearer") return null;
+
   return token?.trim() || null;
 }
 
-export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function PATCH(req: NextRequest, context: RouteContext) {
   try {
-    const quoteId = ctx.params.id;
+    const { id: quoteId } = await context.params;
 
     const token = getBearerToken(req);
     if (!token) {
@@ -28,7 +32,7 @@ export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
 
     const email = userData.user.email.trim().toLowerCase();
 
-    // Get profile id
+    // Profile id
     const { data: profile, error: profileErr } = await supabaseServer
       .from("profiles")
       .select("id")
@@ -39,7 +43,7 @@ export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
       return NextResponse.json({ error: "Profile not found" }, { status: 404 });
     }
 
-    // Load the quote and ensure it belongs to this user
+    // Quote ownership + status
     const { data: quote, error: quoteErr } = await supabaseServer
       .from("quotes")
       .select("id, client_id, status")
@@ -54,8 +58,9 @@ export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
       return NextResponse.json({ error: "Not allowed" }, { status: 403 });
     }
 
-    // ✅ Lock rule: approved quotes cannot be changed
     const status = String(quote.status || "").toLowerCase();
+
+    // ✅ Approved = locked forever
     if (status === "approved") {
       return NextResponse.json(
         { error: "This quote is approved and locked. You can no longer edit it." },
@@ -63,10 +68,17 @@ export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
       );
     }
 
-    // Read allowed edit fields from body
+    // Also don’t allow editing cancelled quotes
+    if (status === "cancelled") {
+      return NextResponse.json(
+        { error: "This quote is cancelled. You can’t edit it." },
+        { status: 409 }
+      );
+    }
+
     const body = await req.json();
 
-    // Only allow editing these (you can expand later)
+    // Only allow editing safe fields (expand later as needed)
     const updates: Record<string, unknown> = {};
 
     if (typeof body.job_location_address === "string") {
@@ -89,7 +101,7 @@ export async function PATCH(req: NextRequest, ctx: { params: { id: string } }) {
       return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });
     }
 
-    // Optional: if you want edits to force re-review:
+    // Optional policy: editing forces re-review (uncomment if you want)
     // updates.status = "pending";
 
     const { data: updated, error: updateErr } = await supabaseServer
