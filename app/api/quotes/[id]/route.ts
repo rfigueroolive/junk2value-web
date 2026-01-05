@@ -19,7 +19,10 @@ function extractBearerToken(req: NextRequest): string | null {
   return match ? match[1].trim() : null;
 }
 
-export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) {
+export async function DELETE(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
   try {
     const token = extractBearerToken(req);
     if (!token) return jsonError("Missing Authorization bearer token", 401);
@@ -29,9 +32,9 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
       return jsonError("Invalid token", 401, { error: userErr?.message ?? "Invalid token" });
     }
 
-    const quoteId = ctx.params.id;
+    const { id: quoteId } = await context.params;
 
-    // 1) Read the quote so we can enforce "only cancelled can be deleted"
+    // Read quote
     const { data: quote, error: readErr } = await supabaseAdmin
       .from("quotes")
       .select("*")
@@ -41,15 +44,13 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
     if (readErr) return jsonError("Failed to read quote", 500, { error: readErr.message });
     if (!quote) return jsonError("Quote not found", 404);
 
-    const status = String(quote.status ?? "").toLowerCase().trim();
+    // Only allow delete if cancelled
+    const status = String((quote as any).status ?? "").toLowerCase().trim();
     if (status !== "cancelled" && status !== "canceled") {
       return jsonError("Only cancelled quotes can be deleted.", 400);
     }
 
-    // NOTE: we are NOT enforcing ownership yet because your table doesn't have a user_id column.
-    // Once we know the correct owner column, we’ll add:
-    // if (quote[OWNER_COL] !== userData.user.id) return jsonError("Forbidden", 403);
-
+    // Delete it
     const { error: delErr } = await supabaseAdmin.from("quotes").delete().eq("id", quoteId);
     if (delErr) return jsonError("Delete failed", 500, { error: delErr.message });
 
