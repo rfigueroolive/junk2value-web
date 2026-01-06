@@ -1,88 +1,90 @@
-// app/api/quotes/[id]/cancel/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-function getBearerToken(req: NextRequest): string | null {
-  const auth = req.headers.get("authorization") || req.headers.get("Authorization");
-  if (!auth) return null;
-
-  const [scheme, token] = auth.split(" ");
-  if (!scheme || scheme.toLowerCase() !== "bearer") return null;
-
-  return token?.trim() || null;
+function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
+  return NextResponse.json({ success: false, message, ...(extra ?? {}) }, { status });
 }
 
-export async function POST(req: NextRequest, context: any) {
+function getBearerToken(req: NextRequest): string | null {
+  const h = req.headers.get("authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+export async function POST(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
   try {
-    const { id: quoteId } = await Promise.resolve(context?.params);
+    const { id } = await context.params;
 
     const token = getBearerToken(req);
-    if (!token) {
-      return NextResponse.json({ error: "Missing Bearer token" }, { status: 401 });
-    }
+    if (!token) return jsonError("Missing Authorization header", 401);
 
+    // ✅ Validate token + get user
     const { data: userData, error: userErr } = await supabaseServer.auth.getUser(token);
-    if (userErr || !userData?.user?.email) {
-      return NextResponse.json({ error: "Invalid session" }, { status: 401 });
+    if (userErr || !userData?.user) {
+      return jsonError("Invalid token", 401, { error: userErr?.message });
     }
 
-    const email = userData.user.email.trim().toLowerCase();
+    const userId = userData.user.id;
 
-    const { data: profile, error: profileErr } = await supabaseServer
-      .from("profiles")
-      .select("id")
-      .eq("email", email)
-      .single();
-
-    if (profileErr || !profile?.id) {
-      return NextResponse.json({ error: "Profile not found" }, { status: 404 });
-    }
-
+    // ✅ Load quote
     const { data: quote, error: quoteErr } = await supabaseServer
       .from("quotes")
-      .select("id, client_id, status")
-      .eq("id", quoteId)
-      .single();
+      .select("id,status,profile_id,customer_id,created_by,owner_id,user_uuid")
+      .eq("id", id)
+      .maybeSingle();
 
-    if (quoteErr || !quote) {
-      return NextResponse.json({ error: "Quote not found" }, { status: 404 });
+    if (quoteErr) return jsonError("Failed to load quote", 500, { error: quoteErr.message });
+    if (!quote) return jsonError("Quote not found", 404);
+
+    // ✅ Determine which owner column exists + is populated
+    const ownerCandidates = ["profile_id", "customer_id", "created_by", "owner_id", "user_uuid"] as const;
+
+    const ownerKey = ownerCandidates.find((k) => (quote as any)[k] != null) ?? null;
+    const ownerValue = ownerKey ? String((quote as any)[ownerKey]) : "";
+
+    // If quote isn't tied to a user, don't allow cancel from authenticated route
+    if (!ownerKey || !ownerValue) {
+      return jsonError("Not allowed", 403, {
+        error: "Quote is not linked to a user (missing owner column value)",
+        tried: ownerCandidates,
+      });
     }
 
-    if (quote.client_id !== profile.id) {
-      return NextResponse.json({ error: "Not allowed" }, { status: 403 });
+    // ✅ Ownership check
+    if (ownerValue !== userId) {
+      return jsonError("Not allowed", 403, {
+        error: `Quote does not belong to this user`,
+        ownerKey,
+        ownerValue,
+        userId,
+      });
     }
 
     const status = String(quote.status || "").toLowerCase();
 
+    // ✅ Business rule: approved quotes are locked
     if (status === "approved") {
-      return NextResponse.json(
-        { error: "This quote is approved and locked. You can no longer cancel it." },
-        { status: 409 }
-      );
+      return jsonError("Not allowed", 403, { error: "Approved quotes cannot be cancelled" });
     }
 
-    if (status === "cancelled") {
-      return NextResponse.json({ success: true, status: "cancelled" }, { status: 200 });
+    // ✅ Already cancelled? Fine—return success (idempotent)
+    if (status === "cancelled" || status === "canceled") {
+      return NextResponse.json({ success: true });
     }
 
-    const { data: cancelled, error: cancelErr } = await supabaseServer
+    // ✅ Cancel it
+    const { error: updErr } = await supabaseServer
       .from("quotes")
-      .update({
-        status: "cancelled",
-        cancelled_at: new Date().toISOString(),
-      })
-      .eq("id", quoteId)
-      .select()
-      .single();
+      .update({ status: "cancelled" })
+      .eq("id", id);
 
-    if (cancelErr) {
-      console.error("Cancel quote error:", cancelErr);
-      return NextResponse.json({ error: "Failed to cancel quote" }, { status: 500 });
-    }
+    if (updErr) return jsonError("Cancel quote failed", 500, { error: updErr.message });
 
-    return NextResponse.json(cancelled, { status: 200 });
-  } catch (e) {
-    console.error("POST /api/quotes/[id]/cancel error:", e);
-    return NextResponse.json({ error: "Server error" }, { status: 500 });
+    return NextResponse.json({ success: true });
+  } catch (e: any) {
+    return jsonError("Server error", 500, { error: e?.message ?? String(e) });
   }
 }
