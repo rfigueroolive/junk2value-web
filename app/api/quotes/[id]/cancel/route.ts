@@ -29,48 +29,53 @@ export async function POST(
 
     const userId = userData.user.id;
 
-    // ✅ Load quote
+    // ✅ Load quote without referencing columns that may not exist
     const { data: quote, error: quoteErr } = await supabaseServer
       .from("quotes")
-      .select("id,status,profile_id,customer_id,created_by,owner_id,user_uuid")
+      .select("*")
       .eq("id", id)
       .maybeSingle();
 
     if (quoteErr) return jsonError("Failed to load quote", 500, { error: quoteErr.message });
     if (!quote) return jsonError("Quote not found", 404);
 
-    // ✅ Determine which owner column exists + is populated
-    const ownerCandidates = ["profile_id", "customer_id", "created_by", "owner_id", "user_uuid"] as const;
+    // ✅ Ownership check (only checks keys that actually exist on the row)
+    const candidates = ["user_id", "profile_id", "customer_id", "created_by", "owner_id", "user_uuid"];
+    let ownerKey: string | null = null;
+    let ownerValue: string | null = null;
 
-    const ownerKey = ownerCandidates.find((k) => (quote as any)[k] != null) ?? null;
-    const ownerValue = ownerKey ? String((quote as any)[ownerKey]) : "";
+    for (const k of candidates) {
+      if (Object.prototype.hasOwnProperty.call(quote, k) && (quote as any)[k] != null) {
+        ownerKey = k;
+        ownerValue = String((quote as any)[k]);
+        break;
+      }
+    }
 
-    // If quote isn't tied to a user, don't allow cancel from authenticated route
     if (!ownerKey || !ownerValue) {
       return jsonError("Not allowed", 403, {
-        error: "Quote is not linked to a user (missing owner column value)",
-        tried: ownerCandidates,
+        error: "Quote is not linked to a user (no owner column found on row)",
+        tried: candidates,
       });
     }
 
-    // ✅ Ownership check
     if (ownerValue !== userId) {
       return jsonError("Not allowed", 403, {
-        error: `Quote does not belong to this user`,
+        error: "Quote does not belong to this user",
         ownerKey,
         ownerValue,
         userId,
       });
     }
 
-    const status = String(quote.status || "").toLowerCase();
+    const status = String((quote as any).status || "").toLowerCase();
 
     // ✅ Business rule: approved quotes are locked
     if (status === "approved") {
       return jsonError("Not allowed", 403, { error: "Approved quotes cannot be cancelled" });
     }
 
-    // ✅ Already cancelled? Fine—return success (idempotent)
+    // ✅ Idempotent: if already cancelled, just return success
     if (status === "cancelled" || status === "canceled") {
       return NextResponse.json({ success: true });
     }
