@@ -18,6 +18,14 @@ function getSupabaseAuthClient() {
   return createClient(url, anonKey);
 }
 
+// Some Supabase versions return email confirmation on different fields.
+// We accept any of these as "confirmed".
+function isAuthEmailConfirmed(user: any): boolean {
+  return Boolean(
+    user?.email_confirmed_at || user?.confirmed_at || user?.confirmedAt
+  );
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { email, password } = await req.json();
@@ -46,7 +54,7 @@ export async function POST(req: NextRequest) {
 
     const userId = data.user.id;
 
-    // 2) Check our app-level verification flags in profiles
+    // 2) Load app-level verification flags in profiles
     const { data: profile, error: profileError } = await supabaseServer
       .from("profiles")
       .select("email_verified, phone_verified, sms_opt_in")
@@ -64,10 +72,31 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const emailVerified = profile.email_verified === true;
     const smsOptIn = profile.sms_opt_in === true;
+    let emailVerified = profile.email_verified === true;
     const phoneVerified = profile.phone_verified === true;
 
+    // 🔥 Key fix:
+    // If Supabase Auth says the email is confirmed, but our profile flag is still false,
+    // automatically sync it so the user isn't stuck.
+    const authConfirmed = isAuthEmailConfirmed(data.user);
+
+    if (authConfirmed && !emailVerified) {
+      const { error: syncErr } = await supabaseServer
+        .from("profiles")
+        .update({
+          email_verified: true,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", userId);
+
+      if (!syncErr) {
+        emailVerified = true;
+      }
+      // If sync fails, we fall through and still enforce the flag (safer than letting it pass).
+    }
+
+    // 3) Enforce verification rules
     if (!emailVerified) {
       try {
         await supabase.auth.signOut();
@@ -88,7 +117,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3) Return session (Android uses this token)
+    // 4) Return session (Android uses this token)
     return NextResponse.json(
       {
         user: data.user,
