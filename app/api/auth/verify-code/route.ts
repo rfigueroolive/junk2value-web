@@ -3,37 +3,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json({ success: false, message, error: message, ...(extra ?? {}) }, { status });
+  return NextResponse.json({ success: false, error: message, message, ...(extra ?? {}) }, { status });
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const safeEmail = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-    const safeCode = typeof body.code === "string" ? body.code.trim() : "";
+    const { email, code } = await req.json();
+
+    const safeEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const safeCode = typeof code === "string" ? code.trim() : "";
 
     if (!safeEmail || !safeCode) {
-      return jsonError("Email and code are required.", 400);
+      return jsonError("Email and code are required", 400);
     }
 
-    // 1) Ensure a signup intent exists (new flow: account not created yet)
-    const { data: intentRow, error: intentErr } = await supabaseServer
-      .from("signup_intents")
-      .select("email, phone, sms_opt_in, email_verified, phone_verified")
-      .eq("email", safeEmail)
-      .maybeSingle();
-
-    if (intentErr) {
-      return jsonError("Server error looking up signup intent.", 500, {
-        debug: { message: intentErr.message },
-      });
-    }
-
-    if (!intentRow) {
-      return jsonError("Signup not found for this email. Please start signup again.", 404);
-    }
-
-    // 2) Find the matching email verification code
+    // 1) Find matching code row (latest)
     const { data: codeRow, error: codeErr } = await supabaseServer
       .from("email_verification_codes")
       .select("id, expires_at")
@@ -44,52 +28,83 @@ export async function POST(req: NextRequest) {
       .maybeSingle();
 
     if (codeErr || !codeRow) {
-      return jsonError("Invalid or expired code.", 400, {
-        debug: { codeErr: codeErr ? { message: codeErr.message } : null },
-      });
+      return jsonError("Invalid or expired code", 400);
     }
 
+    // 2) Expiry check
     const expiresAtMs = new Date(codeRow.expires_at).getTime();
     if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
-      return jsonError("Invalid or expired code.", 400);
+      return jsonError("Invalid or expired code", 400);
     }
 
-    // 3) Mark email verified on the intent (NOT on profiles/auth user anymore)
-    const { error: updErr } = await supabaseServer
-      .from("signup_intents")
-      .update({ email_verified: true })
-      .eq("email", safeEmail);
+    // 3) Get userId (prefer profiles lookup because listUsers paging can miss)
+    let userId: string | null = null;
 
-    if (updErr) {
-      return jsonError("Failed to mark email verified.", 500, {
-        debug: {
-          message: updErr.message,
-          details: (updErr as any).details,
-          hint: (updErr as any).hint,
-          code: (updErr as any).code,
-        },
+    const profLookup = await supabaseServer
+      .from("profiles")
+      .select("id")
+      .eq("email", safeEmail)
+      .maybeSingle();
+
+    if (profLookup.data?.id) {
+      userId = profLookup.data.id as string;
+    }
+
+    // Fallback: listUsers and match by email
+    if (!userId) {
+      const { data: usersData, error: listErr } = await supabaseServer.auth.admin.listUsers({
+        page: 1,
+        perPage: 1000,
       });
+
+      if (listErr) {
+        return jsonError("Failed to look up user", 500, { debug: { message: listErr.message } });
+      }
+
+      const matchedUser = usersData?.users?.find((u) => (u.email ?? "").toLowerCase() === safeEmail);
+      if (matchedUser?.id) userId = matchedUser.id;
     }
 
-    // 4) Delete the used code row so it can’t be reused
+    if (!userId) {
+      return jsonError("User not found for this email", 404);
+    }
+
+    // 4) Update SUPABASE AUTH USER METADATA ✅ (this is what your login gate is checking)
+    const { data: authUserRes, error: getErr } = await supabaseServer.auth.admin.getUserById(userId);
+    if (getErr || !authUserRes?.user) {
+      return jsonError("Failed to load auth user", 500, { debug: { message: getErr?.message } });
+    }
+
+    const prevMeta = (authUserRes.user.user_metadata ?? {}) as Record<string, any>;
+
+    const { error: updateErr } = await supabaseServer.auth.admin.updateUserById(userId, {
+      user_metadata: {
+        ...prevMeta,
+        email_verified: true,
+      },
+    });
+
+    if (updateErr) {
+      return jsonError("Failed to update auth metadata", 500, { debug: { message: updateErr.message } });
+    }
+
+    // 5) Best-effort: also mark in profiles (don’t hard-fail if column doesn’t exist)
+    try {
+      await supabaseServer
+        .from("profiles")
+        .update({ email_verified: true })
+        .eq("id", userId);
+    } catch {
+      // ignore
+    }
+
+    // 6) Delete the used code row (prevents reuse)
     await supabaseServer.from("email_verification_codes").delete().eq("id", codeRow.id);
 
-    const needsPhone =
-      intentRow.sms_opt_in === true &&
-      !!intentRow.phone &&
-      intentRow.phone_verified !== true;
-
-    return NextResponse.json(
-      {
-        success: true,
-        message: "Email verified.",
-        needs_phone_verification: needsPhone,
-      },
-      { status: 200 }
-    );
+    return NextResponse.json({ success: true, message: "Email verified." }, { status: 200 });
   } catch (err: any) {
     console.error("verify-code error:", err);
-    return jsonError("Failed to verify code.", 500, {
+    return jsonError("Failed to verify code", 500, {
       debug: { message: err?.message ?? String(err) },
     });
   }
