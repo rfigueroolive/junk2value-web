@@ -24,14 +24,17 @@ function jsonError(
 /**
  * POST /api/auth/signup
  *
- * Flow:
+ * NEW FLOW (NO ACCOUNT CREATED YET):
  *  1) Validate input
- *  2) Create Supabase Auth user (email_confirm=true so Supabase doesn't block sign-in)
- *  3) Create a minimal profile row (id + email) in `profiles`
- *     - This avoids breaking if your profiles table DOESN'T have the extra columns yet
- *     - Also includes a fallback to INSERT if UPSERT fails (missing unique/PK on id)
- *  4) Replace any previous email codes for this email, then insert a fresh code
- *  5) Send email via Mailgun
+ *  2) Create/Update a pending row in `signup_intents` (NOT Supabase Auth)
+ *     - This is the "temporary holding pen" until verification is complete
+ *  3) Replace any previous email codes for this email, then insert a fresh code
+ *  4) Send email via Mailgun
+ *
+ * Next step:
+ *  - /api/auth/verify-code should mark signup_intents.email_verified = true
+ *  - If sms_opt_in == true, /api/auth/verify-phone-code should mark phone_verified = true
+ *  - After last required verification, /api/auth/complete-signup should create the real Auth user
  */
 export async function POST(req: NextRequest) {
   try {
@@ -40,7 +43,7 @@ export async function POST(req: NextRequest) {
     const {
       name,
       email,
-      password,
+      password, // NOTE: we validate strength here but we do NOT store it
       company,
       phone,
       sms_opt_in,
@@ -86,7 +89,7 @@ export async function POST(req: NextRequest) {
       return jsonError("Phone is required when SMS consent is checked.", 400);
     }
 
-    console.log("Signup request received:", {
+    console.log("Signup intent request received:", {
       name: safeName,
       email: safeEmail,
       company: safeCompany,
@@ -94,86 +97,41 @@ export async function POST(req: NextRequest) {
       sms_opt_in: safeSmsOptIn,
     });
 
-    // ----- Create Supabase Auth user -----
-    const { data: created, error: createError } =
-      await supabaseServer.auth.admin.createUser({
-        email: safeEmail,
-        password,
-        email_confirm: true,
-        user_metadata: {
-          name: safeName,
-          company: safeCompany,
-          phone: safePhone,
-          sms_opt_in: safeSmsOptIn,
-          // app-level flags (your app decides what "verified" means)
-          email_verified: false,
-          phone_verified: safeSmsOptIn ? false : true,
-        },
-      });
-
-    if (createError || !created?.user) {
-      console.error("Supabase auth.admin.createUser error:", createError);
-
-      const msg =
-        createError?.message?.toLowerCase().includes("already") === true
-          ? "That email is already registered. Please log in instead."
-          : "Failed to create user. Please try again.";
-
-      return jsonError(msg, 400, {
-        debug: {
-          message: createError?.message,
-          status: (createError as any)?.status,
-        },
-      });
-    }
-
-    const userId = created.user.id;
-
-    // ----- Create profile row (MINIMAL + SAFE) -----
-    // IMPORTANT: this avoids “column does not exist” errors if your profiles table
-    // doesn’t have name/company/phone/etc yet.
-    const minimalProfilePayload = {
-      id: userId,
+    // ----- Create/Update pending signup intent -----
+    // IMPORTANT:
+    // - We do NOT create a Supabase Auth user here.
+    // - We also do NOT store plaintext password in DB.
+    // - The app will pass password forward, and /complete-signup will receive it again.
+    //
+    // Required DB table: `signup_intents` (you will create it).
+    //
+    // We reset verification flags each time signup is started for that email.
+    const intentPayload = {
       email: safeEmail,
+      name: safeName,
+      company: safeCompany,
+      phone: safePhone,
+      sms_opt_in: safeSmsOptIn,
+      email_verified: false,
+      phone_verified: safeSmsOptIn ? false : true, // if no sms, phone is considered "not required"
+      updated_at: new Date().toISOString(),
     };
 
-    let profileAttempt: "upsert" | "insert" = "upsert";
+    // Upsert by email so repeated signup attempts overwrite the intent cleanly.
+    const { data: intentRow, error: intentErr } = await supabaseServer
+      .from("signup_intents")
+      .upsert(intentPayload, { onConflict: "email" })
+      .select("id,email,sms_opt_in,phone")
+      .single();
 
-    // Try upsert first (best case)
-    let { error: profileError } = await supabaseServer
-      .from("profiles")
-      .upsert(minimalProfilePayload, { onConflict: "id" });
-
-    // If upsert fails (ex: no unique constraint on id), try insert as a fallback
-    if (profileError) {
-      console.error("profiles upsert error, trying insert fallback:", profileError);
-
-      profileAttempt = "insert";
-      const insertRes = await supabaseServer
-        .from("profiles")
-        .insert(minimalProfilePayload);
-
-      profileError = insertRes.error ?? null;
-    }
-
-    if (profileError) {
-      console.error("Supabase profile write error:", profileError);
-
-      // Cleanup: avoid orphaned auth user
-      try {
-        await supabaseServer.auth.admin.deleteUser(userId);
-      } catch (cleanupErr) {
-        console.error("Failed cleanup deleteUser after profile error:", cleanupErr);
-      }
-
-      return jsonError("Failed to create user profile. Please try again.", 500, {
+    if (intentErr || !intentRow) {
+      console.error("signup_intents upsert error:", intentErr);
+      return jsonError("Failed to start signup. Please try again.", 500, {
         debug: {
-          attempted_profile_payload: minimalProfilePayload,
-          attempt: profileAttempt,
-          code: (profileError as any).code,
-          message: profileError.message,
-          details: (profileError as any).details,
-          hint: (profileError as any).hint,
+          message: intentErr?.message,
+          details: (intentErr as any)?.details,
+          hint: (intentErr as any)?.hint,
+          code: (intentErr as any)?.code,
         },
       });
     }
@@ -185,7 +143,10 @@ export async function POST(req: NextRequest) {
     ).toISOString();
 
     // Delete any old codes for this email so only ONE code is valid at a time
-    await supabaseServer.from("email_verification_codes").delete().eq("email", safeEmail);
+    await supabaseServer
+      .from("email_verification_codes")
+      .delete()
+      .eq("email", safeEmail);
 
     const { error: insertError } = await supabaseServer
       .from("email_verification_codes")
@@ -197,14 +158,6 @@ export async function POST(req: NextRequest) {
 
     if (insertError) {
       console.error("email_verification_codes insert error:", insertError);
-
-      // Cleanup to avoid "created but can't verify" accounts
-      try {
-        await supabaseServer.auth.admin.deleteUser(userId);
-      } catch (cleanupErr) {
-        console.error("Failed cleanup deleteUser after code insert error:", cleanupErr);
-      }
-
       return jsonError("Failed to create verification code. Please try again.", 500, {
         debug: {
           code: (insertError as any).code,
@@ -232,18 +185,8 @@ export async function POST(req: NextRequest) {
       );
     } catch (mailError: any) {
       console.error("Mailgun send error (signup):", mailError);
-
-      // Cleanup so we don't keep accounts that never got a code
-      try {
-        await supabaseServer.auth.admin.deleteUser(userId);
-      } catch (cleanupErr) {
-        console.error("Failed cleanup deleteUser after mail error:", cleanupErr);
-      }
-
       return jsonError("Failed to send verification email. Please try again.", 500, {
-        debug: {
-          message: mailError?.message ?? String(mailError),
-        },
+        debug: { message: mailError?.message ?? String(mailError) },
       });
     }
 
@@ -251,6 +194,8 @@ export async function POST(req: NextRequest) {
       {
         success: true,
         message: "Signup started. A verification code has been sent to your email.",
+        intent_id: intentRow.id,
+        requires_phone_verification: safeSmsOptIn && !!safePhone,
       },
       { status: 200 }
     );
