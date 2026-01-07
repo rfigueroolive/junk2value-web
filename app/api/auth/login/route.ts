@@ -18,11 +18,14 @@ function getSupabaseAuthClient() {
   return createClient(url, anonKey);
 }
 
-// Some Supabase versions return email confirmation on different fields.
-// We accept any of these as "confirmed".
+// Supabase has returned different confirmation fields across versions.
+// We treat any of these as "confirmed".
 function isAuthEmailConfirmed(user: any): boolean {
   return Boolean(
-    user?.email_confirmed_at || user?.confirmed_at || user?.confirmedAt
+    user?.email_confirmed_at ||
+      user?.confirmed_at ||
+      user?.confirmedAt ||
+      user?.emailConfirmedAt
   );
 }
 
@@ -39,7 +42,7 @@ export async function POST(req: NextRequest) {
 
     const supabase = getSupabaseAuthClient();
 
-    // 1) Attempt sign-in
+    // 1) Attempt sign-in (using anon key is correct here)
     const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
@@ -54,7 +57,21 @@ export async function POST(req: NextRequest) {
 
     const userId = data.user.id;
 
-    // 2) Load app-level verification flags in profiles
+    // 2) Determine email confirmation from Auth (source of truth)
+    // Sometimes the session user object can be missing confirmation fields,
+    // so we double-check via admin API (service role) for reliability.
+    let authConfirmed = isAuthEmailConfirmed(data.user);
+
+    if (!authConfirmed) {
+      const { data: adminRes, error: adminErr } =
+        await supabaseServer.auth.admin.getUserById(userId);
+
+      if (!adminErr && adminRes?.user) {
+        authConfirmed = isAuthEmailConfirmed(adminRes.user);
+      }
+    }
+
+    // 3) Load app-level flags in profiles (used for phone gating + sync)
     const { data: profile, error: profileError } = await supabaseServer
       .from("profiles")
       .select("email_verified, phone_verified, sms_opt_in")
@@ -73,30 +90,26 @@ export async function POST(req: NextRequest) {
     }
 
     const smsOptIn = profile.sms_opt_in === true;
-    let emailVerified = profile.email_verified === true;
     const phoneVerified = profile.phone_verified === true;
 
-    // 🔥 Key fix:
-    // If Supabase Auth says the email is confirmed, but our profile flag is still false,
-    // automatically sync it so the user isn't stuck.
-    const authConfirmed = isAuthEmailConfirmed(data.user);
+    // ✅ FIX:
+    // Email verification must be based on Supabase Auth confirmation.
+    // The profiles.email_verified flag is allowed to lag behind (we sync it best-effort).
+    let emailVerified = authConfirmed || profile.email_verified === true;
 
-    if (authConfirmed && !emailVerified) {
-      const { error: syncErr } = await supabaseServer
+    // Best-effort sync so your profiles table stays consistent (but never blocks login)
+    if (authConfirmed && profile.email_verified !== true) {
+      await supabaseServer
         .from("profiles")
         .update({
           email_verified: true,
           updated_at: new Date().toISOString(),
         })
         .eq("id", userId);
-
-      if (!syncErr) {
-        emailVerified = true;
-      }
-      // If sync fails, we fall through and still enforce the flag (safer than letting it pass).
     }
 
-    // 3) Enforce verification rules
+    // 4) Enforce verification rules
+    // If Auth isn't confirmed, block. (This should not happen in your case now.)
     if (!emailVerified) {
       try {
         await supabase.auth.signOut();
@@ -107,6 +120,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Phone gating stays app-level (only if they opted into SMS)
     if (smsOptIn && !phoneVerified) {
       try {
         await supabase.auth.signOut();
@@ -117,7 +131,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 4) Return session (Android uses this token)
+    // 5) Return session (Android uses this token)
     return NextResponse.json(
       {
         user: data.user,
