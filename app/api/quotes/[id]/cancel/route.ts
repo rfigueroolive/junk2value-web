@@ -11,6 +11,11 @@ function getBearerToken(req: NextRequest): string | null {
   return m ? m[1].trim() : null;
 }
 
+function extractEmailFromText(text: string): string | null {
+  const m = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return m ? m[0].toLowerCase() : null;
+}
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ id: string }> }
@@ -28,6 +33,7 @@ export async function POST(
     }
 
     const userId = userData.user.id;
+    const userEmail = (userData.user.email || "").toLowerCase();
 
     // ✅ Load quote without referencing columns that may not exist
     const { data: quote, error: quoteErr } = await supabaseServer
@@ -39,12 +45,21 @@ export async function POST(
     if (quoteErr) return jsonError("Failed to load quote", 500, { error: quoteErr.message });
     if (!quote) return jsonError("Quote not found", 404);
 
-    // ✅ Ownership check (only checks keys that actually exist on the row)
-    const candidates = ["user_id", "profile_id", "customer_id", "created_by", "owner_id", "user_uuid"];
+    // ✅ Try common owner columns (only if they actually exist on this row)
+    const ownerCandidates = [
+      "user_id",
+      "user_uuid",
+      "owner_id",
+      "created_by",
+      "customer_id",
+      "profile_id",
+      "account_id",
+    ];
+
     let ownerKey: string | null = null;
     let ownerValue: string | null = null;
 
-    for (const k of candidates) {
+    for (const k of ownerCandidates) {
       if (Object.prototype.hasOwnProperty.call(quote, k) && (quote as any)[k] != null) {
         ownerKey = k;
         ownerValue = String((quote as any)[k]);
@@ -52,20 +67,54 @@ export async function POST(
       }
     }
 
-    if (!ownerKey || !ownerValue) {
-      return jsonError("Not allowed", 403, {
-        error: "Quote is not linked to a user (no owner column found on row)",
-        tried: candidates,
-      });
-    }
+    // ✅ If no owner id column exists, fall back to email-based ownership.
+    // This is a pragmatic bridge until you add a real user_id column to quotes.
+    let emailMatched = false;
 
-    if (ownerValue !== userId) {
-      return jsonError("Not allowed", 403, {
-        error: "Quote does not belong to this user",
-        ownerKey,
-        ownerValue,
-        userId,
-      });
+    if (!ownerKey || !ownerValue) {
+      const possibleEmailFields = ["email", "customer_email", "account_email", "created_by_email"];
+
+      // 1) Check real email columns if they exist
+      for (const k of possibleEmailFields) {
+        if (Object.prototype.hasOwnProperty.call(quote, k) && (quote as any)[k]) {
+          const qEmail = String((quote as any)[k]).toLowerCase();
+          if (userEmail && qEmail === userEmail) {
+            emailMatched = true;
+            break;
+          }
+        }
+      }
+
+      // 2) Check notes (your current app writes email in notes)
+      if (!emailMatched) {
+        const notes = String((quote as any).notes || "");
+        const emailInNotes = extractEmailFromText(notes);
+        if (userEmail && emailInNotes && emailInNotes === userEmail) {
+          emailMatched = true;
+        } else if (userEmail && notes.toLowerCase().includes(userEmail)) {
+          // extra lenient: direct substring match
+          emailMatched = true;
+        }
+      }
+
+      if (!emailMatched) {
+        return jsonError("Not allowed", 403, {
+          error: "Quote is not linked to a user (no owner id column) and email fallback did not match",
+          userId,
+          userEmail,
+          quoteKeys: Object.keys(quote),
+        });
+      }
+    } else {
+      // ✅ Owner id column exists: enforce it
+      if (ownerValue !== userId) {
+        return jsonError("Not allowed", 403, {
+          error: "Quote does not belong to this user",
+          ownerKey,
+          ownerValue,
+          userId,
+        });
+      }
     }
 
     const status = String((quote as any).status || "").toLowerCase();
