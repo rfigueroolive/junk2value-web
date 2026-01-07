@@ -2,11 +2,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
-  return NextResponse.json({ success: false, message, error: message, ...(extra ?? {}) }, { status });
+function jsonError(
+  message: string,
+  status: number,
+  extra?: Record<string, unknown>
+) {
+  return NextResponse.json(
+    { success: false, message, error: message, ...(extra ?? {}) },
+    { status }
+  );
 }
 
 async function createAuthUserFromIntent(intent: any, password: string) {
+  // Create the Supabase Auth user (confirmed immediately because code verified)
   const { data: created, error } = await supabaseServer.auth.admin.createUser({
     email: intent.email,
     password,
@@ -17,7 +25,7 @@ async function createAuthUserFromIntent(intent: any, password: string) {
       phone: intent.phone,
       sms_opt_in: intent.sms_opt_in === true,
       email_verified: true,
-      phone_verified: intent.sms_opt_in ? (intent.phone_verified === true) : true,
+      phone_verified: intent.sms_opt_in ? intent.phone_verified === true : true,
     },
   });
 
@@ -27,8 +35,31 @@ async function createAuthUserFromIntent(intent: any, password: string) {
 
   const userId = created.user.id;
 
-  // minimal profile row (safe)
-  await supabaseServer.from("profiles").upsert({ id: userId, email: intent.email }, { onConflict: "id" });
+  // ✅ IMPORTANT:
+  // Keep our profiles table in sync with the reality of verification.
+  // This prevents login/API gating or UI badges from getting stuck.
+  const smsOptIn = intent.sms_opt_in === true;
+  const phoneVerified = smsOptIn ? intent.phone_verified === true : true;
+
+  const { error: upsertErr } = await supabaseServer
+    .from("profiles")
+    .upsert(
+      {
+        id: userId,
+        email: intent.email,
+        // sync flags
+        email_verified: true,
+        sms_opt_in: smsOptIn,
+        phone_verified: phoneVerified,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "id" }
+    );
+
+  // If this fails, we still created the auth user; return error so you can see it.
+  if (upsertErr) {
+    return { user: created.user, error: upsertErr };
+  }
 
   return { user: created.user, error: null };
 }
@@ -37,12 +68,14 @@ export async function POST(req: NextRequest) {
   try {
     const { email, code, password } = await req.json();
 
-    const safeEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const safeEmail =
+      typeof email === "string" ? email.trim().toLowerCase() : "";
     const safeCode = typeof code === "string" ? code.trim() : "";
 
-    if (!safeEmail || !safeCode) return jsonError("Email and code are required", 400);
+    if (!safeEmail || !safeCode)
+      return jsonError("Email and code are required", 400);
 
-    // 1) validate code
+    // 1) Validate code
     const { data: codeRow } = await supabaseServer
       .from("email_verification_codes")
       .select("id, expires_at")
@@ -59,7 +92,7 @@ export async function POST(req: NextRequest) {
       return jsonError("Invalid or expired code", 400);
     }
 
-    // 2) load signup intent (THIS replaces “user lookup”)
+    // 2) Load signup intent
     const { data: intent, error: intentErr } = await supabaseServer
       .from("signup_intents")
       .select("*")
@@ -67,24 +100,34 @@ export async function POST(req: NextRequest) {
       .maybeSingle();
 
     if (intentErr || !intent) {
-      return jsonError("Signup not found for this email. Please sign up again.", 404);
+      return jsonError(
+        "Signup not found for this email. Please sign up again.",
+        404
+      );
     }
 
-    // 3) mark email verified
+    // 3) Mark email verified on the intent (recordkeeping)
     await supabaseServer
       .from("signup_intents")
       .update({ email_verified: true, updated_at: new Date().toISOString() })
       .eq("email", safeEmail);
 
-    // 4) consume code
-    await supabaseServer.from("email_verification_codes").delete().eq("id", codeRow.id);
+    // 4) Consume code
+    await supabaseServer
+      .from("email_verification_codes")
+      .delete()
+      .eq("id", codeRow.id);
 
-    // 5) if phone required, stop here (last step is phone)
+    // 5) If phone required, stop here (last step is phone)
     if (intent.sms_opt_in === true) {
-      return NextResponse.json({ success: true, next_step: "phone" }, { status: 200 });
+      // NOTE: Account creation happens after phone verification in your flow.
+      return NextResponse.json(
+        { success: true, next_step: "phone" },
+        { status: 200 }
+      );
     }
 
-    // 6) otherwise email is the last step -> finalize account creation NOW
+    // 6) Otherwise email is the last step -> finalize account creation NOW
     const pw = typeof password === "string" ? password : "";
     if (!pw) {
       return jsonError(
@@ -97,16 +140,23 @@ export async function POST(req: NextRequest) {
 
     if (error) {
       const msg =
-        error.message?.toLowerCase().includes("already") ? "Account already exists." : "Failed to create account.";
-      return jsonError(msg, 400, { debug: { message: error.message } });
+        (error as any)?.message?.toLowerCase().includes("already")
+          ? "Account already exists."
+          : "Failed to finalize signup.";
+      return jsonError(msg, 400, {
+        debug: { message: (error as any)?.message ?? String(error) },
+        user_created: Boolean(user),
+      });
     }
 
-    // cleanup intent
+    // Cleanup intent
     await supabaseServer.from("signup_intents").delete().eq("email", safeEmail);
 
     return NextResponse.json({ success: true, finalized: true }, { status: 200 });
   } catch (err: any) {
     console.error("verify-code error:", err);
-    return jsonError("Server error", 500, { debug: { message: err?.message ?? String(err) } });
+    return jsonError("Server error", 500, {
+      debug: { message: err?.message ?? String(err) },
+    });
   }
 }
