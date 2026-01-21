@@ -18,10 +18,15 @@ function jsonError(message: string, status: number, extra?: Record<string, unkno
 
 function looksLikeMissingColumn(err: any): boolean {
   const msg = (err?.message || err?.details || err?.hint || "").toString().toLowerCase();
-  return msg.includes("could not find the") || msg.includes("schema cache") || msg.includes("does not exist");
+  return (
+    msg.includes("could not find the") ||
+    msg.includes("schema cache") ||
+    msg.includes("does not exist") ||
+    msg.includes("unknown column")
+  );
 }
 
-// Your consignment_items owner column is unknown, so we try a small set quickly.
+// consignment_items owner column is unknown, so we try a small set quickly
 const OWNER_COLS = ["user_id", "client_id", "profile_id", "owner_id", "created_by"] as const;
 
 /**
@@ -64,11 +69,9 @@ async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
  * Verify the item belongs to the caller by trying:
  *  - ownerCol in OWNER_COLS
  *  - ownerValue in [authUserId, profileId]
- *
- * Returns which ownerCol/value matched, or null if not owned.
  */
 async function assertItemOwned(itemId: string, ownerValues: string[]) {
-  const tried: any[] = [];
+  const tried: Array<{ ownerCol: string; ownerValue: string; err?: string }> = [];
 
   for (const ownerCol of OWNER_COLS) {
     for (const ownerValue of ownerValues) {
@@ -85,7 +88,7 @@ async function assertItemOwned(itemId: string, ownerValues: string[]) {
 
       tried.push({ ownerCol, ownerValue, err: res.error?.message });
 
-      // If it's NOT a missing column error, return it (could be RLS, bad id column, etc.)
+      // If it's NOT a missing column error, bubble it (could be RLS etc.)
       if (res.error && !looksLikeMissingColumn(res.error)) {
         return { ok: false as const, error: res.error, tried };
       }
@@ -97,7 +100,6 @@ async function assertItemOwned(itemId: string, ownerValues: string[]) {
 
 // -------------------------
 // GET /api/consignment/photos?item_id=...
-// Returns photos for an item (only if owned)
 // -------------------------
 export async function GET(req: NextRequest) {
   try {
@@ -119,15 +121,10 @@ export async function GET(req: NextRequest) {
 
     const owned = await assertItemOwned(itemId, ownerValues);
     if (!owned.ok) {
-      // if we hit a real DB error (not missing-column), show it
       if (owned.error) {
-        return jsonError(owned.error.message ?? "Failed ownership check", 500, {
-          debug: { tried: owned.tried },
-        });
+        return jsonError(owned.error.message ?? "Failed ownership check", 500, { debug: { tried: owned.tried } });
       }
-      return jsonError("Not allowed (item does not belong to this user)", 403, {
-        debug: { tried: owned.tried },
-      });
+      return jsonError("Not allowed (item does not belong to this user)", 403, { debug: { tried: owned.tried } });
     }
 
     const photosRes = await supabaseServer
@@ -152,7 +149,6 @@ export async function GET(req: NextRequest) {
 // -------------------------
 // POST /api/consignment/photos
 // Body: { item_id, photo_url } OR { item_id, photo_urls: string[] }
-// Inserts rows into consignment_photos (item_id, photo_url)
 // -------------------------
 export async function POST(req: NextRequest) {
   try {
@@ -166,15 +162,17 @@ export async function POST(req: NextRequest) {
     const authUserId = userData.user.id;
     if (!email) return jsonError("User email missing on session", 400);
 
-    const body = await req.json();
+    const body: any = await req.json();
 
     const itemId = String(body.item_id ?? "").trim();
     if (!itemId) return jsonError("item_id is required", 400);
 
     const one = typeof body.photo_url === "string" ? body.photo_url.trim() : "";
-    const many = Array.isArray(body.photo_urls) ? body.photo_urls.map((x: any) => String(x).trim()).filter(Boolean) : [];
+    const many: string[] = Array.isArray(body.photo_urls)
+      ? body.photo_urls.map((x: unknown) => String(x).trim()).filter((x: string) => Boolean(x))
+      : [];
 
-    const urls = many.length ? many : (one ? [one] : []);
+    const urls: string[] = many.length ? many : (one ? [one] : []);
     if (!urls.length) return jsonError("photo_url or photo_urls is required", 400);
 
     const profileId = await getOrCreateProfileIdByEmail(email);
@@ -183,21 +181,15 @@ export async function POST(req: NextRequest) {
     const owned = await assertItemOwned(itemId, ownerValues);
     if (!owned.ok) {
       if (owned.error) {
-        return jsonError(owned.error.message ?? "Failed ownership check", 500, {
-          debug: { tried: owned.tried },
-        });
+        return jsonError(owned.error.message ?? "Failed ownership check", 500, { debug: { tried: owned.tried } });
       }
-      return jsonError("Not allowed (item does not belong to this user)", 403, {
-        debug: { tried: owned.tried },
-      });
+      return jsonError("Not allowed (item does not belong to this user)", 403, { debug: { tried: owned.tried } });
     }
 
-    const rows = urls.map((u) => ({ item_id: itemId, photo_url: u }));
+    // ✅ Fix: explicitly type u as string
+    const rows = urls.map((u: string) => ({ item_id: itemId, photo_url: u }));
 
-    const ins = await supabaseServer
-      .from("consignment_photos")
-      .insert(rows)
-      .select("*");
+    const ins = await supabaseServer.from("consignment_photos").insert(rows).select("*");
 
     if (ins.error) {
       return jsonError(ins.error.message ?? "Failed to insert photos", 500);
