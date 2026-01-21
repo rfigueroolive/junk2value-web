@@ -48,12 +48,96 @@ function parseOptionalPositiveInt(val: any): number | null {
   return intVal;
 }
 
-/**
- * Email-only profile lookup (because your profiles table does NOT have user_id).
- * - select by email
- * - insert { email } if missing
- * - if insert fails (unique/race), re-select
- */
+function looksLikeDuplicateTracking(err: any): boolean {
+  const msg = (err?.message || err?.error_description || err?.details || "").toString().toLowerCase();
+  return msg.includes("duplicate") || msg.includes("unique") || msg.includes("tracking");
+}
+
+// -------------------------
+// Schema discovery (no more guessing)
+// -------------------------
+type ColMap = {
+  ownerCol: string; // required
+  titleCol: string; // required
+  descCol?: string;
+  notesCol?: string;
+  countCol?: string;
+  statusCol?: string;
+  trackingCol?: string;
+  createdAtCol?: string;
+};
+
+async function getTableColumns(tableName: string): Promise<Set<string>> {
+  // Use information_schema to discover columns (service-role should be allowed)
+  const { data, error } = await supabaseServer
+    .from("information_schema.columns")
+    .select("column_name")
+    .eq("table_schema", "public")
+    .eq("table_name", tableName);
+
+  if (error) throw error;
+
+  const set = new Set<string>();
+  (data ?? []).forEach((row: any) => {
+    if (row?.column_name) set.add(String(row.column_name));
+  });
+  return set;
+}
+
+function pickFirstExisting(cols: Set<string>, candidates: string[]): string | null {
+  for (const c of candidates) if (cols.has(c)) return c;
+  return null;
+}
+
+async function discoverConsignmentItemsMap(): Promise<{ cols: Set<string>; map: ColMap }> {
+  const cols = await getTableColumns("consignment_items");
+
+  // Owner id column: find what YOUR table actually uses
+  const ownerCol =
+    pickFirstExisting(cols, [
+      "client_id",
+      "profile_id",
+      "user_id",
+      "owner_id",
+      "customer_id",
+      "account_id",
+      "created_by",
+      "submitted_by",
+    ]) ?? null;
+
+  if (!ownerCol) {
+    throw new Error(
+      `No owner column found on consignment_items. Columns are: ${Array.from(cols).sort().join(", ")}`
+    );
+  }
+
+  // Title column (required)
+  const titleCol =
+    pickFirstExisting(cols, ["item_title", "title", "name", "item_name"]) ?? null;
+
+  if (!titleCol) {
+    throw new Error(
+      `No title column found on consignment_items. Columns are: ${Array.from(cols).sort().join(", ")}`
+    );
+  }
+
+  // Optional columns
+  const descCol = pickFirstExisting(cols, ["item_description", "description", "details", "item_desc"]);
+  const notesCol = pickFirstExisting(cols, ["notes", "pickup_notes", "comments", "note"]);
+  const countCol = pickFirstExisting(cols, ["item_count", "count", "quantity", "qty"]);
+  const statusCol = pickFirstExisting(cols, ["status", "state"]);
+  const trackingCol = pickFirstExisting(cols, ["tracking_number", "tracking", "tracking_no"]);
+  const createdAtCol = pickFirstExisting(cols, ["created_at", "created", "inserted_at"]);
+
+  return {
+    cols,
+    map: { ownerCol, titleCol, descCol, notesCol, countCol, statusCol, trackingCol, createdAtCol },
+  };
+}
+
+// -------------------------
+// Profiles (email-only, since your profiles table has no user_id)
+// -------------------------
 async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
   const email = emailRaw.trim().toLowerCase();
 
@@ -87,11 +171,9 @@ async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
   throw createErr ?? new Error("Failed to create profile");
 }
 
-function looksLikeDuplicateTracking(err: any): boolean {
-  const msg = (err?.message || err?.error_description || "").toString().toLowerCase();
-  return msg.includes("duplicate") || msg.includes("unique") || msg.includes("tracking");
-}
-
+// -------------------------
+// Insert logic (uses discovered columns)
+// -------------------------
 async function tryInsertOnce(payload: Record<string, any>) {
   const { data, error } = await supabaseServer
     .from("consignment_items")
@@ -102,113 +184,58 @@ async function tryInsertOnce(payload: Record<string, any>) {
   return { data, error };
 }
 
-/**
- * Insert fallback for YOUR schema:
- * - Only uses client_id (NO profile_id anywhere)
- * - Tries with/without status
- * - Tries title vs item_title variations
- * - Tries item_count vs quantity
- * - Tries with/without tracking_number
- */
-async function insertConsignmentWithFallback(args: {
-  ownerId: string;
+async function insertConsignmentSmart(args: {
+  profileId: string;
+  map: ColMap;
   itemTitle: string;
   itemDesc?: string | null;
   itemCount?: number | null;
   notes?: string | null;
 }) {
-  const baseShapes: Array<{ name: string; payload: () => Record<string, any> }> = [
-    {
-      name: "snake_case",
-      payload: () => ({
-        client_id: args.ownerId,
-        item_title: args.itemTitle,
-        item_description: args.itemDesc ?? null,
-        item_count: args.itemCount ?? null,
-        notes: args.notes ?? null,
-      }),
-    },
-    {
-      name: "title/description + item_count",
-      payload: () => ({
-        client_id: args.ownerId,
-        title: args.itemTitle,
-        description: args.itemDesc ?? null,
-        item_count: args.itemCount ?? null,
-        notes: args.notes ?? null,
-      }),
-    },
-    {
-      name: "title/description + quantity",
-      payload: () => ({
-        client_id: args.ownerId,
-        title: args.itemTitle,
-        description: args.itemDesc ?? null,
-        quantity: args.itemCount ?? null,
-        notes: args.notes ?? null,
-      }),
-    },
-    {
-      name: "minimal_title",
-      payload: () => ({
-        client_id: args.ownerId,
-        title: args.itemTitle,
-      }),
-    },
-    {
-      name: "minimal_item_title",
-      payload: () => ({
-        client_id: args.ownerId,
-        item_title: args.itemTitle,
-      }),
-    },
-  ];
+  const { map } = args;
 
-  const statusVariants: Array<{ name: string; addStatus: boolean }> = [
-    { name: "with_status", addStatus: true },
-    { name: "no_status", addStatus: false },
-  ];
+  // Build payload using ONLY known-good columns
+  const payload: Record<string, any> = {};
+  payload[map.ownerCol] = args.profileId;
+  payload[map.titleCol] = args.itemTitle;
 
-  const trackingVariants: Array<{ name: string; usesTracking: boolean }> = [
-    { name: "with_tracking", usesTracking: true },
-    { name: "no_tracking", usesTracking: false },
-  ];
+  if (map.descCol && args.itemDesc != null) payload[map.descCol] = args.itemDesc;
+  if (map.notesCol && args.notes != null) payload[map.notesCol] = args.notes;
+  if (map.countCol && args.itemCount != null) payload[map.countCol] = args.itemCount;
+  if (map.statusCol) payload[map.statusCol] = "pending";
+
+  // Tracking retry if the column exists
+  const usesTracking = !!map.trackingCol;
+  const maxTrackingRetries = usesTracking ? 6 : 1;
 
   let lastError: any = null;
 
-  for (const shape of baseShapes) {
-    for (const statusV of statusVariants) {
-      for (const trackV of trackingVariants) {
-        const maxTrackingRetries = trackV.usesTracking ? 6 : 1;
+  for (let i = 0; i < maxTrackingRetries; i++) {
+    const attemptPayload = { ...payload };
 
-        for (let i = 0; i < maxTrackingRetries; i++) {
-          const tracking = trackV.usesTracking ? makeTrackingNumber() : null;
-
-          const payload: Record<string, any> = { ...shape.payload() };
-          if (statusV.addStatus) payload.status = "pending";
-          if (trackV.usesTracking) payload.tracking_number = tracking;
-
-          const { data, error } = await tryInsertOnce(payload);
-
-          if (!error && data) {
-            return {
-              data,
-              tracking_number: (data as any).tracking_number ?? tracking,
-              used_attempt: `${shape.name} / ${statusV.name} / ${trackV.name}`,
-            };
-          }
-
-          lastError = { attempt: `${shape.name} / ${statusV.name} / ${trackV.name}`, error };
-
-          if (!(trackV.usesTracking && looksLikeDuplicateTracking(error))) {
-            break;
-          }
-        }
-      }
+    let tracking: string | null = null;
+    if (map.trackingCol) {
+      tracking = makeTrackingNumber();
+      attemptPayload[map.trackingCol] = tracking;
     }
+
+    const { data, error } = await tryInsertOnce(attemptPayload);
+
+    if (!error && data) {
+      return {
+        data,
+        tracking_number:
+          (map.trackingCol ? (data as any)?.[map.trackingCol] : null) ?? tracking,
+      };
+    }
+
+    lastError = error;
+
+    // only retry on “tracking collision” type errors
+    if (!(usesTracking && looksLikeDuplicateTracking(error))) break;
   }
 
-  throw lastError;
+  throw lastError ?? new Error("Insert failed");
 }
 
 // -------------------------
@@ -227,39 +254,41 @@ export async function GET(req: NextRequest) {
 
     const profileId = await getOrCreateProfileIdByEmail(email);
 
-    // Only use client_id (no profile_id)
-    const primary = await supabaseServer
-      .from("consignment_items")
-      .select("*")
-      .eq("client_id", profileId)
-      .order("created_at", { ascending: false })
-      .limit(200);
+    const { map } = await discoverConsignmentItemsMap();
 
-    if (!primary.error) {
-      return NextResponse.json({ success: true, items: primary.data ?? [] }, { status: 200 });
+    // Query using discovered owner col
+    let q = supabaseServer.from("consignment_items").select("*").eq(map.ownerCol, profileId).limit(200);
+
+    // Order if we have a created column
+    if (map.createdAtCol) {
+      q = q.order(map.createdAtCol, { ascending: false });
     }
 
-    // Fallback without ordering (still client_id)
-    const fallback = await supabaseServer
-      .from("consignment_items")
-      .select("*")
-      .eq("client_id", profileId)
-      .limit(200);
+    const res = await q;
 
-    if (!fallback.error) {
-      return NextResponse.json({ success: true, items: fallback.data ?? [] }, { status: 200 });
+    if (res.error) {
+      console.error("GET consignment_items error:", res.error);
+      return jsonError(res.error.message ?? "Failed to load consignment items", 500, {
+        debug: { message: res.error.message },
+      });
     }
 
-    console.error("GET consignment_items error:", primary.error, fallback.error);
-    return jsonError("Failed to load consignment items", 500, {
-      debug: {
-        primary: primary.error?.message,
-        fallback: fallback.error?.message,
+    return NextResponse.json(
+      {
+        success: true,
+        items: res.data ?? [],
+        debug_columns: {
+          ownerCol: map.ownerCol,
+          createdAtCol: map.createdAtCol ?? null,
+        },
       },
-    });
+      { status: 200 }
+    );
   } catch (err: any) {
     console.error("Unexpected error in GET /api/consignment:", err);
-    return jsonError("Server error", 500, { debug: { message: err?.message ?? String(err) } });
+    return jsonError(err?.message ?? "Server error", 500, {
+      debug: { message: err?.message ?? String(err) },
+    });
   }
 }
 
@@ -287,9 +316,11 @@ export async function POST(req: NextRequest) {
     if (!itemTitle) return jsonError("item_title is required", 400);
 
     const profileId = await getOrCreateProfileIdByEmail(email);
+    const { map, cols } = await discoverConsignmentItemsMap();
 
-    const created = await insertConsignmentWithFallback({
-      ownerId: profileId,
+    const created = await insertConsignmentSmart({
+      profileId,
+      map,
       itemTitle,
       itemDesc,
       itemCount,
@@ -305,21 +336,31 @@ export async function POST(req: NextRequest) {
         item_id: createdId,
         id: createdId,
         item: created.data,
-        tracking_number: created.tracking_number,
-        debug_used_attempt: created.used_attempt,
+        tracking_number: created.tracking_number ?? null,
+        debug_columns: {
+          ownerCol: map.ownerCol,
+          titleCol: map.titleCol,
+          descCol: map.descCol ?? null,
+          notesCol: map.notesCol ?? null,
+          countCol: map.countCol ?? null,
+          statusCol: map.statusCol ?? null,
+          trackingCol: map.trackingCol ?? null,
+          createdAtCol: map.createdAtCol ?? null,
+          // Helpful if you ever need to see the raw list while debugging:
+          // columns: Array.from(cols).sort(),
+        },
       },
       { status: 201 }
     );
   } catch (err: any) {
     console.error("Unexpected error in POST /api/consignment:", err);
 
-    const supaMsg = err?.error?.message ?? err?.error?.details ?? err?.message ?? "Unknown error";
+    const msg =
+      err?.message ??
+      err?.error?.message ??
+      err?.error?.details ??
+      "Unknown error";
 
-    return jsonError(supaMsg, 500, {
-      debug: {
-        message: supaMsg,
-        attempt: err?.attempt,
-      },
-    });
+    return jsonError(msg, 500, { debug: { message: msg } });
   }
 }
