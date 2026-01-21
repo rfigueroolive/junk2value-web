@@ -49,44 +49,42 @@ function parseOptionalPositiveInt(val: any): number | null {
 }
 
 /**
- * More reliable than email-only:
- * - Try profiles.user_id first
- * - Fall back to profiles.email
- * - Create with BOTH user_id + email when missing
+ * Email-only profile lookup (because your profiles table does NOT have user_id).
+ * - select by email
+ * - insert { email } if missing
+ * - if insert fails (unique/race), re-select
  */
-async function getOrCreateProfileId(args: { email: string; userId: string }): Promise<string> {
-  const email = args.email.trim().toLowerCase();
-  const userId = args.userId;
+async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
+  const email = emailRaw.trim().toLowerCase();
 
-  // 1) by user_id (best)
-  const byUserId = await supabaseServer
-    .from("profiles")
-    .select("id")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  if (byUserId.error) throw byUserId.error;
-  if (byUserId.data?.id) return byUserId.data.id as string;
-
-  // 2) by email (fallback)
-  const byEmail = await supabaseServer
+  const { data: profile, error: profileErr } = await supabaseServer
     .from("profiles")
     .select("id")
     .eq("email", email)
     .maybeSingle();
 
-  if (byEmail.error) throw byEmail.error;
-  if (byEmail.data?.id) return byEmail.data.id as string;
+  if (profileErr) throw profileErr;
+  if (profile?.id) return profile.id as string;
 
-  // 3) create profile (include user_id so NOT NULL constraints don’t explode)
-  const created = await supabaseServer
+  const { data: created, error: createErr } = await supabaseServer
     .from("profiles")
-    .insert([{ email, user_id: userId }])
+    .insert([{ email }])
     .select("id")
     .single();
 
-  if (created.error) throw created.error;
-  return created.data.id as string;
+  if (!createErr && created?.id) return created.id as string;
+
+  // Fallback: handle unique constraint / concurrent insert
+  const { data: again, error: againErr } = await supabaseServer
+    .from("profiles")
+    .select("id")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (againErr) throw againErr;
+  if (again?.id) return again.id as string;
+
+  throw createErr ?? new Error("Failed to create profile");
 }
 
 function looksLikeDuplicateTracking(err: any): boolean {
@@ -95,12 +93,7 @@ function looksLikeDuplicateTracking(err: any): boolean {
 }
 
 async function tryInsertOnce(payload: Record<string, any>) {
-  const { data, error } = await supabaseServer
-    .from("consignment_items")
-    .insert([payload])
-    .select()
-    .single();
-
+  const { data, error } = await supabaseServer.from("consignment_items").insert([payload]).select().single();
   return { data, error };
 }
 
@@ -206,7 +199,10 @@ async function insertConsignmentWithFallback(args: {
               };
             }
 
-            lastError = { attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`, error };
+            lastError = {
+              attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`,
+              error,
+            };
 
             if (!(trackV.usesTracking && looksLikeDuplicateTracking(error))) {
               break;
@@ -232,10 +228,9 @@ export async function GET(req: NextRequest) {
     if (userErr || !userData?.user) return jsonError("Invalid or expired session token", 401);
 
     const email = userData.user.email?.trim().toLowerCase();
-    const userId = userData.user.id;
     if (!email) return jsonError("User email missing on session", 400);
 
-    const profileId = await getOrCreateProfileId({ email, userId });
+    const profileId = await getOrCreateProfileIdByEmail(email);
 
     // Try client_id first
     const primary = await supabaseServer
@@ -262,11 +257,7 @@ export async function GET(req: NextRequest) {
     }
 
     // Fallback without ordering
-    const fallback2 = await supabaseServer
-      .from("consignment_items")
-      .select("*")
-      .eq("client_id", profileId)
-      .limit(200);
+    const fallback2 = await supabaseServer.from("consignment_items").select("*").eq("client_id", profileId).limit(200);
 
     if (!fallback2.error) {
       return NextResponse.json({ success: true, items: fallback2.data ?? [] }, { status: 200 });
@@ -298,7 +289,6 @@ export async function POST(req: NextRequest) {
     if (userErr || !userData?.user) return jsonError("Invalid or expired session token", 401);
 
     const email = userData.user.email?.trim().toLowerCase();
-    const userId = userData.user.id;
     if (!email) return jsonError("User email missing on session", 400);
 
     const body = await req.json();
@@ -310,7 +300,7 @@ export async function POST(req: NextRequest) {
 
     if (!itemTitle) return jsonError("item_title is required", 400);
 
-    const profileId = await getOrCreateProfileId({ email, userId });
+    const profileId = await getOrCreateProfileIdByEmail(email);
 
     const created = await insertConsignmentWithFallback({
       ownerId: profileId,
@@ -326,8 +316,8 @@ export async function POST(req: NextRequest) {
       {
         success: true,
         message: "Consignment request created.",
-        item_id: createdId,          // ✅ top-level for Android
-        id: createdId,               // ✅ also top-level
+        item_id: createdId,
+        id: createdId,
         item: created.data,
         tracking_number: created.tracking_number,
         debug_used_attempt: created.used_attempt,
@@ -337,13 +327,8 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     console.error("Unexpected error in POST /api/consignment:", err);
 
-    const supaMsg =
-      err?.error?.message ??
-      err?.error?.details ??
-      err?.message ??
-      "Unknown error";
+    const supaMsg = err?.error?.message ?? err?.error?.details ?? err?.message ?? "Unknown error";
 
-    // ✅ Return the real message so your Android toast is useful while debugging
     return jsonError(supaMsg, 500, {
       debug: {
         message: supaMsg,
