@@ -49,7 +49,9 @@ function parseOptionalPositiveInt(val: any): number | null {
 }
 
 function looksLikeDuplicateTracking(err: any): boolean {
-  const msg = (err?.message || err?.error_description || err?.details || "").toString().toLowerCase();
+  const msg = (err?.message || err?.error_description || err?.details || "")
+    .toString()
+    .toLowerCase();
   return msg.includes("duplicate") || msg.includes("unique") || msg.includes("tracking");
 }
 
@@ -68,7 +70,6 @@ type ColMap = {
 };
 
 async function getTableColumns(tableName: string): Promise<Set<string>> {
-  // Use information_schema to discover columns (service-role should be allowed)
   const { data, error } = await supabaseServer
     .from("information_schema.columns")
     .select("column_name")
@@ -84,26 +85,25 @@ async function getTableColumns(tableName: string): Promise<Set<string>> {
   return set;
 }
 
-function pickFirstExisting(cols: Set<string>, candidates: string[]): string | null {
+// ✅ Return undefined (not null) so it matches ColMap optional fields.
+function pickFirstExisting(cols: Set<string>, candidates: string[]): string | undefined {
   for (const c of candidates) if (cols.has(c)) return c;
-  return null;
+  return undefined;
 }
 
 async function discoverConsignmentItemsMap(): Promise<{ cols: Set<string>; map: ColMap }> {
   const cols = await getTableColumns("consignment_items");
 
-  // Owner id column: find what YOUR table actually uses
-  const ownerCol =
-    pickFirstExisting(cols, [
-      "client_id",
-      "profile_id",
-      "user_id",
-      "owner_id",
-      "customer_id",
-      "account_id",
-      "created_by",
-      "submitted_by",
-    ]) ?? null;
+  const ownerCol = pickFirstExisting(cols, [
+    "client_id",
+    "profile_id",
+    "user_id",
+    "owner_id",
+    "customer_id",
+    "account_id",
+    "created_by",
+    "submitted_by",
+  ]);
 
   if (!ownerCol) {
     throw new Error(
@@ -111,9 +111,7 @@ async function discoverConsignmentItemsMap(): Promise<{ cols: Set<string>; map: 
     );
   }
 
-  // Title column (required)
-  const titleCol =
-    pickFirstExisting(cols, ["item_title", "title", "name", "item_name"]) ?? null;
+  const titleCol = pickFirstExisting(cols, ["item_title", "title", "name", "item_name"]);
 
   if (!titleCol) {
     throw new Error(
@@ -121,7 +119,6 @@ async function discoverConsignmentItemsMap(): Promise<{ cols: Set<string>; map: 
     );
   }
 
-  // Optional columns
   const descCol = pickFirstExisting(cols, ["item_description", "description", "details", "item_desc"]);
   const notesCol = pickFirstExisting(cols, ["notes", "pickup_notes", "comments", "note"]);
   const countCol = pickFirstExisting(cols, ["item_count", "count", "quantity", "qty"]);
@@ -194,7 +191,6 @@ async function insertConsignmentSmart(args: {
 }) {
   const { map } = args;
 
-  // Build payload using ONLY known-good columns
   const payload: Record<string, any> = {};
   payload[map.ownerCol] = args.profileId;
   payload[map.titleCol] = args.itemTitle;
@@ -204,7 +200,6 @@ async function insertConsignmentSmart(args: {
   if (map.countCol && args.itemCount != null) payload[map.countCol] = args.itemCount;
   if (map.statusCol) payload[map.statusCol] = "pending";
 
-  // Tracking retry if the column exists
   const usesTracking = !!map.trackingCol;
   const maxTrackingRetries = usesTracking ? 6 : 1;
 
@@ -224,14 +219,12 @@ async function insertConsignmentSmart(args: {
     if (!error && data) {
       return {
         data,
-        tracking_number:
-          (map.trackingCol ? (data as any)?.[map.trackingCol] : null) ?? tracking,
+        tracking_number: (map.trackingCol ? (data as any)?.[map.trackingCol] : undefined) ?? tracking,
       };
     }
 
     lastError = error;
 
-    // only retry on “tracking collision” type errors
     if (!(usesTracking && looksLikeDuplicateTracking(error))) break;
   }
 
@@ -256,10 +249,12 @@ export async function GET(req: NextRequest) {
 
     const { map } = await discoverConsignmentItemsMap();
 
-    // Query using discovered owner col
-    let q = supabaseServer.from("consignment_items").select("*").eq(map.ownerCol, profileId).limit(200);
+    let q = supabaseServer
+      .from("consignment_items")
+      .select("*")
+      .eq(map.ownerCol, profileId)
+      .limit(200);
 
-    // Order if we have a created column
     if (map.createdAtCol) {
       q = q.order(map.createdAtCol, { ascending: false });
     }
@@ -355,11 +350,7 @@ export async function POST(req: NextRequest) {
   } catch (err: any) {
     console.error("Unexpected error in POST /api/consignment:", err);
 
-    const msg =
-      err?.message ??
-      err?.error?.message ??
-      err?.error?.details ??
-      "Unknown error";
+    const msg = err?.message ?? err?.error?.message ?? err?.error?.details ?? "Unknown error";
 
     return jsonError(msg, 500, { debug: { message: msg } });
   }
