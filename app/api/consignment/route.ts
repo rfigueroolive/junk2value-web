@@ -23,7 +23,6 @@ function jsonError(message: string, status: number, extra?: Record<string, unkno
 }
 
 function makeTrackingNumber(): string {
-  // Example: J2V-8F3K29Q1
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let out = "J2V-";
   for (let i = 0; i < 8; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -45,33 +44,53 @@ function parseOptionalPositiveInt(val: any): number | null {
   if (!Number.isFinite(n)) return null;
 
   const intVal = Math.floor(n);
-  if (intVal < 1) return 1; // clamp
+  if (intVal < 1) return 1;
   return intVal;
 }
 
-async function getOrCreateProfileIdByEmail(email: string): Promise<string> {
-  const { data: profile, error: profileErr } = await supabaseServer
+/**
+ * More reliable than email-only:
+ * - Try profiles.user_id first
+ * - Fall back to profiles.email
+ * - Create with BOTH user_id + email when missing
+ */
+async function getOrCreateProfileId(args: { email: string; userId: string }): Promise<string> {
+  const email = args.email.trim().toLowerCase();
+  const userId = args.userId;
+
+  // 1) by user_id (best)
+  const byUserId = await supabaseServer
+    .from("profiles")
+    .select("id")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (byUserId.error) throw byUserId.error;
+  if (byUserId.data?.id) return byUserId.data.id as string;
+
+  // 2) by email (fallback)
+  const byEmail = await supabaseServer
     .from("profiles")
     .select("id")
     .eq("email", email)
     .maybeSingle();
 
-  if (profileErr) throw profileErr;
-  if (profile?.id) return profile.id;
+  if (byEmail.error) throw byEmail.error;
+  if (byEmail.data?.id) return byEmail.data.id as string;
 
-  const { data: created, error: createErr } = await supabaseServer
+  // 3) create profile (include user_id so NOT NULL constraints don’t explode)
+  const created = await supabaseServer
     .from("profiles")
-    .insert([{ email }])
+    .insert([{ email, user_id: userId }])
     .select("id")
     .single();
 
-  if (createErr) throw createErr;
-  return created.id as string;
+  if (created.error) throw created.error;
+  return created.data.id as string;
 }
 
 function looksLikeDuplicateTracking(err: any): boolean {
   const msg = (err?.message || err?.error_description || "").toString().toLowerCase();
-  // covers typical Postgres unique constraint messages
   return msg.includes("duplicate") || msg.includes("unique") || msg.includes("tracking");
 }
 
@@ -85,116 +104,115 @@ async function tryInsertOnce(payload: Record<string, any>) {
   return { data, error };
 }
 
+/**
+ * We try a bunch of payload variations to match whatever your table currently looks like:
+ * - client_id vs profile_id
+ * - with/without status
+ * - item_title vs title
+ * - item_description vs description
+ * - item_count vs quantity
+ * - with/without tracking_number
+ */
 async function insertConsignmentWithFallback(args: {
-  clientId: string;
+  ownerId: string;
   itemTitle: string;
   itemDesc?: string | null;
   itemCount?: number | null;
   notes?: string | null;
 }) {
-  // We try a few common schemas (so you don’t have to babysit column naming right now)
-  const attempts: Array<{ name: string; basePayload: Record<string, any>; usesTracking: boolean }> =
-    [
-      {
-        name: "snake_case + tracking_number",
-        usesTracking: true,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          item_title: args.itemTitle,
-          item_description: args.itemDesc ?? null,
-          item_count: args.itemCount ?? null,
-          notes: args.notes ?? null,
-        },
-      },
-      {
-        name: "title/description + tracking_number",
-        usesTracking: true,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          title: args.itemTitle,
-          description: args.itemDesc ?? null,
-          item_count: args.itemCount ?? null,
-          notes: args.notes ?? null,
-        },
-      },
-      {
-        name: "title/description/quantity + tracking_number",
-        usesTracking: true,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          title: args.itemTitle,
-          description: args.itemDesc ?? null,
-          quantity: args.itemCount ?? null,
-          notes: args.notes ?? null,
-        },
-      },
-      // If your table doesn't have tracking_number yet, these will still work:
-      {
-        name: "snake_case (no tracking_number)",
-        usesTracking: false,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          item_title: args.itemTitle,
-          item_description: args.itemDesc ?? null,
-          item_count: args.itemCount ?? null,
-          notes: args.notes ?? null,
-        },
-      },
-      {
-        name: "title/description (no tracking_number)",
-        usesTracking: false,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          title: args.itemTitle,
-          description: args.itemDesc ?? null,
-          item_count: args.itemCount ?? null,
-          notes: args.notes ?? null,
-        },
-      },
-      {
-        name: "minimal",
-        usesTracking: false,
-        basePayload: {
-          client_id: args.clientId,
-          status: "pending",
-          title: args.itemTitle,
-        },
-      },
-    ];
+  const ownerKeys = ["client_id", "profile_id"] as const;
+
+  const baseShapes: Array<{ name: string; payload: (ownerKey: string) => Record<string, any> }> = [
+    {
+      name: "snake_case",
+      payload: (k) => ({
+        [k]: args.ownerId,
+        item_title: args.itemTitle,
+        item_description: args.itemDesc ?? null,
+        item_count: args.itemCount ?? null,
+        notes: args.notes ?? null,
+      }),
+    },
+    {
+      name: "title/description + item_count",
+      payload: (k) => ({
+        [k]: args.ownerId,
+        title: args.itemTitle,
+        description: args.itemDesc ?? null,
+        item_count: args.itemCount ?? null,
+        notes: args.notes ?? null,
+      }),
+    },
+    {
+      name: "title/description + quantity",
+      payload: (k) => ({
+        [k]: args.ownerId,
+        title: args.itemTitle,
+        description: args.itemDesc ?? null,
+        quantity: args.itemCount ?? null,
+        notes: args.notes ?? null,
+      }),
+    },
+    {
+      name: "minimal_title",
+      payload: (k) => ({
+        [k]: args.ownerId,
+        title: args.itemTitle,
+      }),
+    },
+    {
+      name: "minimal_item_title",
+      payload: (k) => ({
+        [k]: args.ownerId,
+        item_title: args.itemTitle,
+      }),
+    },
+  ];
+
+  const statusVariants: Array<{ name: string; addStatus: boolean }> = [
+    { name: "with_status", addStatus: true },
+    { name: "no_status", addStatus: false },
+  ];
+
+  const trackingVariants: Array<{ name: string; usesTracking: boolean }> = [
+    { name: "with_tracking", usesTracking: true },
+    { name: "no_tracking", usesTracking: false },
+  ];
 
   let lastError: any = null;
 
-  for (const attempt of attempts) {
-    // If the schema supports tracking_number, retry a few times on collision
-    const maxTrackingRetries = attempt.usesTracking ? 6 : 1;
+  for (const ownerKey of ownerKeys) {
+    for (const shape of baseShapes) {
+      for (const statusV of statusVariants) {
+        for (const trackV of trackingVariants) {
+          const maxTrackingRetries = trackV.usesTracking ? 6 : 1;
 
-    for (let i = 0; i < maxTrackingRetries; i++) {
-      const tracking = attempt.usesTracking ? makeTrackingNumber() : null;
+          for (let i = 0; i < maxTrackingRetries; i++) {
+            const tracking = trackV.usesTracking ? makeTrackingNumber() : null;
 
-      const payload = attempt.usesTracking
-        ? { ...attempt.basePayload, tracking_number: tracking }
-        : { ...attempt.basePayload };
+            const base = shape.payload(ownerKey);
+            const payload: Record<string, any> = { ...base };
 
-      const { data, error } = await tryInsertOnce(payload);
+            if (statusV.addStatus) payload.status = "pending";
+            if (trackV.usesTracking) payload.tracking_number = tracking;
 
-      if (!error && data) {
-        return {
-          data,
-          tracking_number: (data as any).tracking_number ?? tracking,
-          used_attempt: attempt.name,
-        };
-      }
+            const { data, error } = await tryInsertOnce(payload);
 
-      lastError = { attempt: attempt.name, error };
+            if (!error && data) {
+              return {
+                data,
+                tracking_number: (data as any).tracking_number ?? tracking,
+                used_attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`,
+              };
+            }
 
-      // Only retry when it *looks* like a tracking collision (unique constraint etc.)
-      if (!(attempt.usesTracking && looksLikeDuplicateTracking(error))) {
-        break;
+            lastError = { attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`, error };
+
+            if (!(trackV.usesTracking && looksLikeDuplicateTracking(error))) {
+              break;
+            }
+          }
+        }
       }
     }
   }
@@ -204,7 +222,6 @@ async function insertConsignmentWithFallback(args: {
 
 // -------------------------
 // GET /api/consignment
-// Returns the user's consignment items
 // -------------------------
 export async function GET(req: NextRequest) {
   try {
@@ -215,11 +232,12 @@ export async function GET(req: NextRequest) {
     if (userErr || !userData?.user) return jsonError("Invalid or expired session token", 401);
 
     const email = userData.user.email?.trim().toLowerCase();
+    const userId = userData.user.id;
     if (!email) return jsonError("User email missing on session", 400);
 
-    const profileId = await getOrCreateProfileIdByEmail(email);
+    const profileId = await getOrCreateProfileId({ email, userId });
 
-    // Try common schema: client_id + created_at ordering
+    // Try client_id first
     const primary = await supabaseServer
       .from("consignment_items")
       .select("*")
@@ -231,7 +249,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, items: primary.data ?? [] }, { status: 200 });
     }
 
-    // Fallback #1: profile_id instead of client_id
+    // Fallback: profile_id
     const fallback1 = await supabaseServer
       .from("consignment_items")
       .select("*")
@@ -243,7 +261,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, items: fallback1.data ?? [] }, { status: 200 });
     }
 
-    // Fallback #2: sometimes created_at isn’t there (or RLS/column mismatch). Try without ordering.
+    // Fallback without ordering
     const fallback2 = await supabaseServer
       .from("consignment_items")
       .select("*")
@@ -270,7 +288,6 @@ export async function GET(req: NextRequest) {
 
 // -------------------------
 // POST /api/consignment
-// Creates a new Pickup & Sell request
 // -------------------------
 export async function POST(req: NextRequest) {
   try {
@@ -281,46 +298,55 @@ export async function POST(req: NextRequest) {
     if (userErr || !userData?.user) return jsonError("Invalid or expired session token", 401);
 
     const email = userData.user.email?.trim().toLowerCase();
+    const userId = userData.user.id;
     if (!email) return jsonError("User email missing on session", 400);
 
     const body = await req.json();
 
-    // Accept a few names from the app, so you can change UI without breaking backend
     const itemTitle = toCleanString(body.item_title ?? body.title ?? body.itemName) ?? "";
     const itemDesc = toCleanString(body.item_description ?? body.description ?? body.itemDesc);
     const notes = toCleanString(body.notes ?? body.pickup_notes);
-
     const itemCount = parseOptionalPositiveInt(body.item_count ?? body.count ?? body.quantity);
 
     if (!itemTitle) return jsonError("item_title is required", 400);
 
-    const profileId = await getOrCreateProfileIdByEmail(email);
+    const profileId = await getOrCreateProfileId({ email, userId });
 
     const created = await insertConsignmentWithFallback({
-      clientId: profileId,
+      ownerId: profileId,
       itemTitle,
       itemDesc,
       itemCount,
       notes,
     });
 
-    // Keep response stable for the app
+    const createdId = (created.data as any)?.id ?? null;
+
     return NextResponse.json(
       {
         success: true,
         message: "Consignment request created.",
+        item_id: createdId,          // ✅ top-level for Android
+        id: createdId,               // ✅ also top-level
         item: created.data,
         tracking_number: created.tracking_number,
-        // keep this for now while we’re wiring things; you can delete later
         debug_used_attempt: created.used_attempt,
       },
       { status: 201 }
     );
   } catch (err: any) {
     console.error("Unexpected error in POST /api/consignment:", err);
-    return jsonError("Invalid request or server error", 500, {
+
+    const supaMsg =
+      err?.error?.message ??
+      err?.error?.details ??
+      err?.message ??
+      "Unknown error";
+
+    // ✅ Return the real message so your Android toast is useful while debugging
+    return jsonError(supaMsg, 500, {
       debug: {
-        message: err?.error?.message ?? err?.message ?? String(err),
+        message: supaMsg,
         attempt: err?.attempt,
       },
     });
