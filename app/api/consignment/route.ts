@@ -74,7 +74,7 @@ async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
 
   if (!createErr && created?.id) return created.id as string;
 
-  // Fallback: handle unique constraint / concurrent insert
+  // handle unique constraint / concurrent insert
   const { data: again, error: againErr } = await supabaseServer
     .from("profiles")
     .select("id")
@@ -93,18 +93,22 @@ function looksLikeDuplicateTracking(err: any): boolean {
 }
 
 async function tryInsertOnce(payload: Record<string, any>) {
-  const { data, error } = await supabaseServer.from("consignment_items").insert([payload]).select().single();
+  const { data, error } = await supabaseServer
+    .from("consignment_items")
+    .insert([payload])
+    .select()
+    .single();
+
   return { data, error };
 }
 
 /**
- * We try a bunch of payload variations to match whatever your table currently looks like:
- * - client_id vs profile_id
- * - with/without status
- * - item_title vs title
- * - item_description vs description
- * - item_count vs quantity
- * - with/without tracking_number
+ * Insert fallback for YOUR schema:
+ * - Only uses client_id (NO profile_id anywhere)
+ * - Tries with/without status
+ * - Tries title vs item_title variations
+ * - Tries item_count vs quantity
+ * - Tries with/without tracking_number
  */
 async function insertConsignmentWithFallback(args: {
   ownerId: string;
@@ -113,13 +117,11 @@ async function insertConsignmentWithFallback(args: {
   itemCount?: number | null;
   notes?: string | null;
 }) {
-  const ownerKeys = ["client_id", "profile_id"] as const;
-
-  const baseShapes: Array<{ name: string; payload: (ownerKey: string) => Record<string, any> }> = [
+  const baseShapes: Array<{ name: string; payload: () => Record<string, any> }> = [
     {
       name: "snake_case",
-      payload: (k) => ({
-        [k]: args.ownerId,
+      payload: () => ({
+        client_id: args.ownerId,
         item_title: args.itemTitle,
         item_description: args.itemDesc ?? null,
         item_count: args.itemCount ?? null,
@@ -128,8 +130,8 @@ async function insertConsignmentWithFallback(args: {
     },
     {
       name: "title/description + item_count",
-      payload: (k) => ({
-        [k]: args.ownerId,
+      payload: () => ({
+        client_id: args.ownerId,
         title: args.itemTitle,
         description: args.itemDesc ?? null,
         item_count: args.itemCount ?? null,
@@ -138,8 +140,8 @@ async function insertConsignmentWithFallback(args: {
     },
     {
       name: "title/description + quantity",
-      payload: (k) => ({
-        [k]: args.ownerId,
+      payload: () => ({
+        client_id: args.ownerId,
         title: args.itemTitle,
         description: args.itemDesc ?? null,
         quantity: args.itemCount ?? null,
@@ -148,15 +150,15 @@ async function insertConsignmentWithFallback(args: {
     },
     {
       name: "minimal_title",
-      payload: (k) => ({
-        [k]: args.ownerId,
+      payload: () => ({
+        client_id: args.ownerId,
         title: args.itemTitle,
       }),
     },
     {
       name: "minimal_item_title",
-      payload: (k) => ({
-        [k]: args.ownerId,
+      payload: () => ({
+        client_id: args.ownerId,
         item_title: args.itemTitle,
       }),
     },
@@ -174,39 +176,32 @@ async function insertConsignmentWithFallback(args: {
 
   let lastError: any = null;
 
-  for (const ownerKey of ownerKeys) {
-    for (const shape of baseShapes) {
-      for (const statusV of statusVariants) {
-        for (const trackV of trackingVariants) {
-          const maxTrackingRetries = trackV.usesTracking ? 6 : 1;
+  for (const shape of baseShapes) {
+    for (const statusV of statusVariants) {
+      for (const trackV of trackingVariants) {
+        const maxTrackingRetries = trackV.usesTracking ? 6 : 1;
 
-          for (let i = 0; i < maxTrackingRetries; i++) {
-            const tracking = trackV.usesTracking ? makeTrackingNumber() : null;
+        for (let i = 0; i < maxTrackingRetries; i++) {
+          const tracking = trackV.usesTracking ? makeTrackingNumber() : null;
 
-            const base = shape.payload(ownerKey);
-            const payload: Record<string, any> = { ...base };
+          const payload: Record<string, any> = { ...shape.payload() };
+          if (statusV.addStatus) payload.status = "pending";
+          if (trackV.usesTracking) payload.tracking_number = tracking;
 
-            if (statusV.addStatus) payload.status = "pending";
-            if (trackV.usesTracking) payload.tracking_number = tracking;
+          const { data, error } = await tryInsertOnce(payload);
 
-            const { data, error } = await tryInsertOnce(payload);
-
-            if (!error && data) {
-              return {
-                data,
-                tracking_number: (data as any).tracking_number ?? tracking,
-                used_attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`,
-              };
-            }
-
-            lastError = {
-              attempt: `${ownerKey} / ${shape.name} / ${statusV.name} / ${trackV.name}`,
-              error,
+          if (!error && data) {
+            return {
+              data,
+              tracking_number: (data as any).tracking_number ?? tracking,
+              used_attempt: `${shape.name} / ${statusV.name} / ${trackV.name}`,
             };
+          }
 
-            if (!(trackV.usesTracking && looksLikeDuplicateTracking(error))) {
-              break;
-            }
+          lastError = { attempt: `${shape.name} / ${statusV.name} / ${trackV.name}`, error };
+
+          if (!(trackV.usesTracking && looksLikeDuplicateTracking(error))) {
+            break;
           }
         }
       }
@@ -232,7 +227,7 @@ export async function GET(req: NextRequest) {
 
     const profileId = await getOrCreateProfileIdByEmail(email);
 
-    // Try client_id first
+    // Only use client_id (no profile_id)
     const primary = await supabaseServer
       .from("consignment_items")
       .select("*")
@@ -244,31 +239,22 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, items: primary.data ?? [] }, { status: 200 });
     }
 
-    // Fallback: profile_id
-    const fallback1 = await supabaseServer
+    // Fallback without ordering (still client_id)
+    const fallback = await supabaseServer
       .from("consignment_items")
       .select("*")
-      .eq("profile_id", profileId)
-      .order("created_at", { ascending: false })
+      .eq("client_id", profileId)
       .limit(200);
 
-    if (!fallback1.error) {
-      return NextResponse.json({ success: true, items: fallback1.data ?? [] }, { status: 200 });
+    if (!fallback.error) {
+      return NextResponse.json({ success: true, items: fallback.data ?? [] }, { status: 200 });
     }
 
-    // Fallback without ordering
-    const fallback2 = await supabaseServer.from("consignment_items").select("*").eq("client_id", profileId).limit(200);
-
-    if (!fallback2.error) {
-      return NextResponse.json({ success: true, items: fallback2.data ?? [] }, { status: 200 });
-    }
-
-    console.error("GET consignment_items error:", primary.error, fallback1.error, fallback2.error);
+    console.error("GET consignment_items error:", primary.error, fallback.error);
     return jsonError("Failed to load consignment items", 500, {
       debug: {
         primary: primary.error?.message,
-        fallback1: fallback1.error?.message,
-        fallback2: fallback2.error?.message,
+        fallback: fallback.error?.message,
       },
     });
   } catch (err: any) {
