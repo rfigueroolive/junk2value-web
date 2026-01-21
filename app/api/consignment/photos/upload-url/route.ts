@@ -15,7 +15,7 @@ function getBearerToken(req: NextRequest): string | null {
 }
 
 async function getAuthedUser(req: NextRequest) {
-  const supabase = supabaseServer;
+  const supabase = supabaseServer; // ✅ your export is a const, not a function
 
   const token = getBearerToken(req);
   if (!token) return { supabase, user: null as any, error: "Missing Authorization Bearer token" };
@@ -69,7 +69,6 @@ async function assertItemOwnership(
 }
 
 function sanitizeFilename(name: string) {
-  // keep it simple + safe for storage paths
   return name.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
@@ -78,9 +77,9 @@ function sanitizeFilename(name: string) {
  * Body: { item_id: string, file_name: string, content_type?: string }
  *
  * Returns:
- *  - upload_url: signed URL to PUT the file bytes to
- *  - path: storage path inside bucket
- *  - public_url: final URL to store in consignment_photos.photo_url (bucket is public)
+ *  - upload_url: signed URL to upload bytes to
+ *  - path: storage path in bucket
+ *  - public_url: store this into consignment_photos.photo_url (bucket is public)
  */
 export async function POST(req: NextRequest) {
   const { supabase, user, error } = await getAuthedUser(req);
@@ -110,16 +109,12 @@ export async function POST(req: NextRequest) {
   const unique = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}`;
   const path = `${profileId}/${itemId}/${unique}-${safeName}`;
 
-  // Supabase v2: createSignedUploadUrl(path)
   const { data, error: signErr } = await supabase.storage.from(BUCKET).createSignedUploadUrl(path);
-
   if (signErr || !data?.signedUrl) {
     return jsonError(signErr?.message ?? "Failed to create signed upload URL", 500);
   }
 
-  // Because you made the bucket PUBLIC, this URL is the one to store in DB
   const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(path);
-  const publicUrl = pub?.publicUrl ?? null;
 
   return NextResponse.json({
     success: true,
@@ -127,7 +122,7 @@ export async function POST(req: NextRequest) {
     path,
     upload_url: data.signedUrl,
     token: data.token ?? null,
-    public_url: publicUrl,
+    public_url: pub?.publicUrl ?? null,
     content_type_hint: contentType ?? null,
   });
 }
