@@ -12,9 +12,9 @@ function getBearerToken(req: NextRequest): string | null {
   return m?.[1] ?? null;
 }
 
-/** profiles: email-only */
 async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
   const email = (emailRaw ?? "").trim().toLowerCase();
+
   const { data: profile, error: profileErr } = await supabaseServer
     .from("profiles")
     .select("id")
@@ -45,14 +45,14 @@ async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
   throw createErr ?? new Error("Failed to create profile");
 }
 
-function normalizeStatus(v: unknown): string {
-  return String(v ?? "").trim().toLowerCase();
+function isPickedUpStatus(v: unknown): boolean {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "picked up" || s === "picked_up" || s === "pickedup";
 }
 
-function isPickedUpStatus(statusValue: unknown): boolean {
-  const s = normalizeStatus(statusValue);
-  // accept a few variations just in case
-  return s === "picked up" || s === "picked_up" || s === "pickedup";
+// (Not required for mobile, but harmless and helps some platforms)
+export async function OPTIONS() {
+  return NextResponse.json({ ok: true }, { status: 200 });
 }
 
 export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) {
@@ -73,7 +73,7 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
     const itemId = String(ctx?.params?.id ?? "").trim();
     if (!itemId) return jsonError("Missing item id", 400);
 
-    // 1) Fetch item (no column guessing in WHERE)
+    // Fetch item
     const itemRes = await supabaseServer
       .from("consignment_items")
       .select("*")
@@ -85,7 +85,7 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
 
     const item = itemRes.data as Record<string, any>;
 
-    // 2) Ownership check (works even if your schema changes)
+    // Ownership check (schema-flexible)
     const ownerFieldCandidates = [
       "user_id",
       "owner_id",
@@ -97,32 +97,19 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
       "profile_id",
     ];
 
-    let owned = false;
-    let matchedOwnerField: string | null = null;
-
-    for (const field of ownerFieldCandidates) {
-      if (Object.prototype.hasOwnProperty.call(item, field) && item[field] != null) {
-        const val = String(item[field]);
-        if (ownerValues.includes(val)) {
-          owned = true;
-          matchedOwnerField = field;
-          break;
+    val@ run {
+      for (f in ownerFieldCandidates) {
+        if (Object.prototype.hasOwnProperty.call(item, f) && item[f] != null) {
+          if (ownerValues.includes(String(item[f]))) return@val
         }
       }
+      return jsonError("Not allowed: item does not belong to you", 403)
     }
 
-    if (!owned) {
-      return jsonError("Not allowed: item does not belong to you", 403, {
-        debug: { ownerValuesTried: ownerValues, availableKeys: Object.keys(item).sort() },
-      });
-    }
-
-    // 3) Block delete if status is Picked Up (company-controlled lock)
-    // Status column could be status/state/etc, so we check a few likely fields.
+    // Block if Picked Up (company locks it)
     const statusFieldCandidates = ["status", "state", "item_status", "job_status"];
-    let statusVal: unknown = null;
-
-    for (const f of statusFieldCandidates) {
+    var statusVal: unknown = null;
+    for (f in statusFieldCandidates) {
       if (Object.prototype.hasOwnProperty.call(item, f)) {
         statusVal = item[f];
         break;
@@ -133,18 +120,17 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
       return jsonError("Cannot cancel: item is already Picked Up", 409);
     }
 
-    // 4) Delete photos first (avoid FK issues)
+    // Delete photos first (FK-safe)
     const photosDel = await supabaseServer
       .from("consignment_photos")
       .delete()
       .eq("item_id", itemId);
 
-    // If photos table doesn't exist or errors, surface it clearly
     if (photosDel.error) {
       return jsonError(`Failed to delete photos: ${photosDel.error.message}`, 500);
     }
 
-    // 5) Delete the item
+    // Delete item
     const itemDel = await supabaseServer
       .from("consignment_items")
       .delete()
@@ -155,12 +141,7 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
     }
 
     return NextResponse.json(
-      {
-        success: true,
-        message: "Consignment item canceled and deleted.",
-        deleted_item_id: itemId,
-        debug_owner_match: matchedOwnerField,
-      },
+      { success: true, message: "Consignment item canceled and deleted.", deleted_item_id: itemId },
       { status: 200 }
     );
   } catch (err: any) {
