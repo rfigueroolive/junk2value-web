@@ -18,7 +18,12 @@ function isPickedUpStatus(v: unknown): boolean {
   return s === "picked up" || s === "picked_up" || s === "pickedup";
 }
 
-export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) {
+// ✅ Next.js in your build expects params to be a Promise
+type RouteContext = {
+  params: Promise<{ id: string }>;
+};
+
+export async function DELETE(req: NextRequest, context: RouteContext) {
   try {
     const token = getBearerToken(req);
     if (!token) return jsonError("Missing Authorization token", 401);
@@ -30,7 +35,10 @@ export async function DELETE(req: NextRequest, ctx: { params: { id: string } }) 
     }
 
     const userId = userRes.user.id;
-    const itemId = String(ctx?.params?.id ?? "").trim();
+
+    // ✅ await params
+    const { id } = await context.params;
+    const itemId = String(id ?? "").trim();
     if (!itemId) return jsonError("Missing item id", 400);
 
     // Load item (your schema uses profile_id = auth user id)
