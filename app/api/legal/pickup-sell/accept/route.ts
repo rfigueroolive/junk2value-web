@@ -259,7 +259,7 @@ export async function POST(req: NextRequest) {
 
     if (ins.error) {
       // If unique index tripped, fetch existing and return it
-      const msg = ins.error.message?.toLowerCase?.() ?? "";
+      const msg = (ins.error.message ?? "").toLowerCase();
       const looksDuplicate = msg.includes("duplicate") || msg.includes("unique");
 
       if (looksDuplicate) {
