@@ -156,6 +156,71 @@ async function generateTermsPdfBytes(acceptedName: string, acceptedAtISO: string
   return await doc.save();
 }
 
+// GET /api/legal/pickup-sell/accept
+// Auth: Authorization: Bearer <access_token>
+// Returns whether the current user has already accepted the terms.
+export async function GET(req: NextRequest) {
+  try {
+    const token = getBearerToken(req);
+    if (!token) return jsonError("Missing Authorization Bearer token", 401);
+
+    const { data: userRes, error: userErr } = await supabaseServer.auth.getUser(token);
+    if (userErr || !userRes?.user?.id) return jsonError("Invalid/expired session token", 401);
+
+    const profileId = userRes.user.id;
+
+    const existing = await supabaseServer
+      .from("legal_acceptances")
+      .select("id, pdf_path, accepted_at, version")
+      .eq("profile_id", profileId)
+      .eq("doc_type", DOC_TYPE)
+      .eq("version", VERSION)
+      .maybeSingle();
+
+    if (existing.error) {
+      return jsonError("Failed checking legal acceptance", 500, { error: existing.error.message });
+    }
+
+    // Not accepted yet
+    if (!existing.data?.pdf_path) {
+      return NextResponse.json(
+        {
+          success: true,
+          accepted: false,
+          doc_type: DOC_TYPE,
+          version: VERSION,
+          payout_percent: PAYOUT_PERCENT,
+          sale_timeframe_days: SALE_TIMEFRAME_DAYS,
+        },
+        { status: 200 }
+      );
+    }
+
+    // Accepted: return a signed URL (1 week)
+    const signed = await supabaseServer.storage
+      .from(BUCKET)
+      .createSignedUrl(existing.data.pdf_path, 60 * 60 * 24 * 7);
+
+    return NextResponse.json(
+      {
+        success: true,
+        accepted: true,
+        doc_type: DOC_TYPE,
+        version: VERSION,
+        accepted_at: existing.data.accepted_at,
+        pdf_path: existing.data.pdf_path,
+        pdf_signed_url: signed.data?.signedUrl ?? null,
+        payout_percent: PAYOUT_PERCENT,
+        sale_timeframe_days: SALE_TIMEFRAME_DAYS,
+      },
+      { status: 200 }
+    );
+  } catch (err: any) {
+    console.error("GET /api/legal/pickup-sell/accept error:", err);
+    return jsonError("Server error", 500, { error: err?.message ?? String(err) });
+  }
+}
+
 // POST /api/legal/pickup-sell/accept
 // Body: { accepted_name: string }
 // Auth: Authorization: Bearer <access_token>
@@ -225,7 +290,7 @@ export async function POST(req: NextRequest) {
     // 3) Hash (proof)
     const sha256 = crypto.createHash("sha256").update(Buffer.from(pdfBytes)).digest("hex");
 
-    // 4) Upload to Storage (private bucket recommended)
+    // 4) Upload to Storage
     const safeTimestamp = acceptedAtISO.replace(/[:.]/g, "-");
     const uuid = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}`;
     const path = `pickup-sell/${VERSION}/${profileId}/${safeTimestamp}-${uuid}.pdf`;
