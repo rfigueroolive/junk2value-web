@@ -15,7 +15,7 @@ function getBearerToken(req: NextRequest): string | null {
 }
 
 async function getAuthedUser(req: NextRequest) {
-  const supabase = supabaseServer; // ✅ your export is a const, not a function
+  const supabase = supabaseServer; // your export is a const, not a function
 
   const token = getBearerToken(req);
   if (!token) return { supabase, user: null as any, error: "Missing Authorization Bearer token" };
@@ -26,46 +26,94 @@ async function getAuthedUser(req: NextRequest) {
   return { supabase, user: data.user, error: null as string | null };
 }
 
-async function getProfileIdForUser(supabase: typeof supabaseServer, user: any): Promise<string | null> {
-  const { data: byUserId } = await supabase
-    .from("profiles")
-    .select("id")
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  if (byUserId?.id) return byUserId.id;
-
-  const email = user.email;
+/**
+ * profiles: email-only (your profiles table has no user_id)
+ */
+async function getOrCreateProfileIdByEmail(supabase: typeof supabaseServer, emailRaw: string) {
+  const email = (emailRaw ?? "").trim().toLowerCase();
   if (!email) return null;
 
-  const { data: byEmail } = await supabase
+  const { data: profile, error: profileErr } = await supabase
     .from("profiles")
     .select("id")
     .eq("email", email)
     .maybeSingle();
 
-  return byEmail?.id ?? null;
+  if (profileErr) throw profileErr;
+  if (profile?.id) return profile.id as string;
+
+  const { data: created, error: createErr } = await supabase
+    .from("profiles")
+    .insert([{ email }])
+    .select("id")
+    .single();
+
+  if (!createErr && created?.id) return created.id as string;
+
+  // concurrent insert fallback
+  const { data: again, error: againErr } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (againErr) throw againErr;
+  if (again?.id) return again.id as string;
+
+  throw createErr ?? new Error("Failed to create profile");
 }
 
-async function assertItemOwnership(
+/**
+ * Ownership check WITHOUT referencing columns that may not exist:
+ * - fetch the item by id
+ * - look at whatever owner-ish column exists on the returned row
+ * - compare against allowed owner values (auth user id + profile id)
+ */
+async function assertItemOwnershipByFetch(
   supabase: typeof supabaseServer,
   itemId: string,
-  profileId: string
-): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
+  ownerValues: string[]
+): Promise<{ ok: true; match: { ownerField: string; ownerValue: string } } | { ok: false; status: number; message: string; debug?: any }> {
   const { data: item, error } = await supabase
     .from("consignment_items")
-    .select("id, profile_id")
+    .select("*")
     .eq("id", itemId)
     .maybeSingle();
 
   if (error) return { ok: false, status: 500, message: error.message };
   if (!item) return { ok: false, status: 404, message: "Item not found" };
 
-  if (item.profile_id !== profileId) {
-    return { ok: false, status: 403, message: "Not allowed: item does not belong to you" };
+  const record = item as Record<string, unknown>;
+
+  const ownerFieldCandidates = [
+    "user_id",
+    "owner_id",
+    "created_by",
+    "submitted_by",
+    "account_id",
+    "customer_id",
+    "client_id",
+    "profile_id",
+  ];
+
+  for (const field of ownerFieldCandidates) {
+    if (Object.prototype.hasOwnProperty.call(record, field)) {
+      const v = record[field];
+      if (v !== null && v !== undefined) {
+        const sv = String(v);
+        if (ownerValues.includes(sv)) {
+          return { ok: true, match: { ownerField: field, ownerValue: sv } };
+        }
+      }
+    }
   }
 
-  return { ok: true };
+  return {
+    ok: false,
+    status: 403,
+    message: "Not allowed: item does not belong to you",
+    debug: { ownerValuesTried: ownerValues, availableKeys: Object.keys(record).sort() },
+  };
 }
 
 function sanitizeFilename(name: string) {
@@ -99,11 +147,23 @@ export async function POST(req: NextRequest) {
   if (!itemId) return jsonError("Missing item_id", 400);
   if (!fileNameRaw) return jsonError("Missing file_name", 400);
 
-  const profileId = await getProfileIdForUser(supabase, user);
+  const email = (user?.email ?? "").trim().toLowerCase();
+  if (!email) return jsonError("User email missing on session", 400);
+
+  // Ensure profile exists (we also use it for the storage path namespace)
+  let profileId: string | null = null;
+  try {
+    profileId = await getOrCreateProfileIdByEmail(supabase, email);
+  } catch (e: any) {
+    return jsonError(e?.message ?? "Failed to load/create profile", 500);
+  }
   if (!profileId) return jsonError("Profile not found for user", 404);
 
-  const own = await assertItemOwnership(supabase, itemId, profileId);
-  if (!own.ok) return jsonError(own.message, own.status);
+  // Ownership check: allow either auth user id OR profile id to match whatever your table uses
+  const ownerValues = [String(user.id), String(profileId)].filter(Boolean);
+
+  const own = await assertItemOwnershipByFetch(supabase, itemId, ownerValues);
+  if (!own.ok) return jsonError(own.message, own.status, own.debug ? { debug: own.debug } : undefined);
 
   const safeName = sanitizeFilename(fileNameRaw);
   const unique = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}`;
@@ -124,5 +184,6 @@ export async function POST(req: NextRequest) {
     token: data.token ?? null,
     public_url: pub?.publicUrl ?? null,
     content_type_hint: contentType ?? null,
+    debug_match: (own as any).match ?? null,
   });
 }
