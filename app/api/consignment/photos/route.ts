@@ -1,4 +1,4 @@
-// src/app/api/consignment/photos/route.ts
+// app/api/consignment/photos/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
@@ -16,21 +16,8 @@ function jsonError(message: string, status: number, extra?: Record<string, unkno
   return NextResponse.json({ success: false, message, ...(extra ?? {}) }, { status });
 }
 
-function looksLikeMissingColumn(err: any): boolean {
-  const msg = (err?.message || err?.details || err?.hint || "").toString().toLowerCase();
-  return (
-    msg.includes("could not find the") ||
-    msg.includes("schema cache") ||
-    msg.includes("does not exist") ||
-    msg.includes("unknown column")
-  );
-}
-
-// consignment_items owner column is unknown, so we try a small set quickly
-const OWNER_COLS = ["user_id", "client_id", "profile_id", "owner_id", "created_by"] as const;
-
 /**
- * profiles: email-only (since your profiles table has no user_id)
+ * profiles: email-only
  */
 async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
   const email = emailRaw.trim().toLowerCase();
@@ -66,36 +53,72 @@ async function getOrCreateProfileIdByEmail(emailRaw: string): Promise<string> {
 }
 
 /**
- * Verify the item belongs to the caller by trying:
- *  - ownerCol in OWNER_COLS
- *  - ownerValue in [authUserId, profileId]
+ * Ownership check WITHOUT querying unknown columns:
+ * 1) Fetch item row by id
+ * 2) Inspect fields on the row and compare to allowed owner values
  */
-async function assertItemOwned(itemId: string, ownerValues: string[]) {
-  const tried: Array<{ ownerCol: string; ownerValue: string; err?: string }> = [];
+async function assertItemOwnedByFetch(itemId: string, ownerValues: string[]) {
+  // Fetch item row
+  const itemRes = await supabaseServer
+    .from("consignment_items")
+    .select("*")
+    .eq("id", itemId)
+    .maybeSingle();
 
-  for (const ownerCol of OWNER_COLS) {
-    for (const ownerValue of ownerValues) {
-      const res = await supabaseServer
-        .from("consignment_items")
-        .select("id")
-        .eq("id", itemId)
-        .eq(ownerCol, ownerValue)
-        .maybeSingle();
+  if (itemRes.error) return { ok: false as const, code: 500 as const, message: itemRes.error.message };
+  if (!itemRes.data) return { ok: false as const, code: 404 as const, message: "Item not found" };
 
-      if (!res.error && res.data?.id) {
-        return { ok: true as const, match: { ownerCol, ownerValue }, tried };
-      }
+  const item: Record<string, unknown> = itemRes.data as any;
 
-      tried.push({ ownerCol, ownerValue, err: res.error?.message });
+  // Possible owner fields that might exist on your table
+  const ownerFieldCandidates = [
+    "user_id",
+    "owner_id",
+    "created_by",
+    "submitted_by",
+    "account_id",
+    "customer_id",
+    "client_id",
+    "profile_id",
+  ];
 
-      // If it's NOT a missing column error, bubble it (could be RLS etc.)
-      if (res.error && !looksLikeMissingColumn(res.error)) {
-        return { ok: false as const, error: res.error, tried };
+  // Find the first candidate field that exists on the row
+  let matchedField: string | null = null;
+  let matchedValue: string | null = null;
+
+  for (const field of ownerFieldCandidates) {
+    if (Object.prototype.hasOwnProperty.call(item, field)) {
+      const v = item[field];
+      if (v !== null && v !== undefined) {
+        const sv = String(v);
+        // If it matches ANY of our allowed owner values, we're good
+        if (ownerValues.includes(sv)) {
+          matchedField = field;
+          matchedValue = sv;
+          break;
+        }
       }
     }
   }
 
-  return { ok: false as const, error: null as any, tried };
+  if (!matchedField) {
+    // No owner field matched our user -> not owned
+    return {
+      ok: false as const,
+      code: 403 as const,
+      message: "Not allowed (item does not belong to this user)",
+      debug: {
+        availableKeys: Object.keys(item).sort(),
+        ownerValuesTried: ownerValues,
+      },
+    };
+  }
+
+  return {
+    ok: true as const,
+    item,
+    match: { ownerField: matchedField, ownerValue: matchedValue },
+  };
 }
 
 // -------------------------
@@ -119,12 +142,9 @@ export async function GET(req: NextRequest) {
     const profileId = await getOrCreateProfileIdByEmail(email);
     const ownerValues = [authUserId, profileId].filter(Boolean);
 
-    const owned = await assertItemOwned(itemId, ownerValues);
+    const owned = await assertItemOwnedByFetch(itemId, ownerValues);
     if (!owned.ok) {
-      if (owned.error) {
-        return jsonError(owned.error.message ?? "Failed ownership check", 500, { debug: { tried: owned.tried } });
-      }
-      return jsonError("Not allowed (item does not belong to this user)", 403, { debug: { tried: owned.tried } });
+      return jsonError(owned.message, owned.code, (owned as any).debug ? { debug: (owned as any).debug } : undefined);
     }
 
     const photosRes = await supabaseServer
@@ -133,12 +153,10 @@ export async function GET(req: NextRequest) {
       .eq("item_id", itemId)
       .order("created_at", { ascending: true });
 
-    if (photosRes.error) {
-      return jsonError(photosRes.error.message ?? "Failed to load photos", 500);
-    }
+    if (photosRes.error) return jsonError(photosRes.error.message ?? "Failed to load photos", 500);
 
     return NextResponse.json(
-      { success: true, photos: photosRes.data ?? [], debug_match: owned.match },
+      { success: true, photos: photosRes.data ?? [], debug_match: (owned as any).match },
       { status: 200 }
     );
   } catch (err: any) {
@@ -178,25 +196,18 @@ export async function POST(req: NextRequest) {
     const profileId = await getOrCreateProfileIdByEmail(email);
     const ownerValues = [authUserId, profileId].filter(Boolean);
 
-    const owned = await assertItemOwned(itemId, ownerValues);
+    const owned = await assertItemOwnedByFetch(itemId, ownerValues);
     if (!owned.ok) {
-      if (owned.error) {
-        return jsonError(owned.error.message ?? "Failed ownership check", 500, { debug: { tried: owned.tried } });
-      }
-      return jsonError("Not allowed (item does not belong to this user)", 403, { debug: { tried: owned.tried } });
+      return jsonError(owned.message, owned.code, (owned as any).debug ? { debug: (owned as any).debug } : undefined);
     }
 
-    // ✅ Fix: explicitly type u as string
     const rows = urls.map((u: string) => ({ item_id: itemId, photo_url: u }));
 
     const ins = await supabaseServer.from("consignment_photos").insert(rows).select("*");
-
-    if (ins.error) {
-      return jsonError(ins.error.message ?? "Failed to insert photos", 500);
-    }
+    if (ins.error) return jsonError(ins.error.message ?? "Failed to insert photos", 500);
 
     return NextResponse.json(
-      { success: true, inserted: ins.data ?? [], debug_match: owned.match },
+      { success: true, inserted: ins.data ?? [], debug_match: (owned as any).match },
       { status: 201 }
     );
   } catch (err: any) {
