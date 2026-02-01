@@ -18,8 +18,8 @@ function envOrThrow(key: string): string {
  */
 export async function GET() {
   try {
-    const clientId = envOrThrow("AfPtntUAyU3LnazOBNf1FXg2rJNDSinJrWiftvqmsZb5aKPxv4x4_ZjH9gr5ln5ypKX6l5-ubTePCaCI");
-    const secret = envOrThrow("EJxb5oggDkUcqKIcKQeQ2Z_Oy8SohlPnZoQr6yhdeAHD0rNj8eoOqyZuIHFjmniZZ2MNqY8oBj_gYDEM");
+    const clientId = envOrThrow("PAYPAL_CLIENT_ID");
+    const secret = envOrThrow("PAYPAL_CLIENT_SECRET");
 
     const basic = Buffer.from(`${clientId}:${secret}`).toString("base64");
 
